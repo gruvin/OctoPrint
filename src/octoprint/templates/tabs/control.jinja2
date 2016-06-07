@@ -92,6 +92,7 @@
         <button class="btn btn-block control-box" data-bind="enable: isOperational() && loginState.isUser(), click: function() { $root.sendFlowRateCommand() }">{{ _('Flow rate:') }}<span data-bind="text: flowRate() + '%'"></span></button>
     </div>
 </div>
+
 <!-- General control panel -->
 <div class="jog-panel" style="display: none;" data-bind="visible: loginState.isUser">
     <h1>{{ _('General') }}</h1>
@@ -101,6 +102,26 @@
         <button class="btn btn-block control-box" data-bind="enable: isOperational() && loginState.isUser(), click: function() { $root.sendCustomCommand({type:'command',command:'M106 S0'}) }">{{ _('Fan off') }}</button>
     </div>
 </div>
+
+<!-- Temperatures display panel -->
+<div class="jog-panel" style="display: none;" data-bind="visible: loginState.isUser">
+    <h1>{{ _('Temps') }}</h1>
+    <div>
+      <table class="table table-bordered table-hover" style="table-layout: fixed; width: inherit;">
+        <tbody>
+        <tr><th></th><th style="text-align: right; padding-top: 0.1em; padding-bottom: 0.1em">ºC</th></tr>
+          <!-- ko foreach: tools -->
+          <tr data-bind="template: { name: 'temprow2-template' }"></tr>
+          <!-- /ko -->
+          <tr data-bind="template: { name: 'temprow2-template', data: bedTemp }, visible: hasBed"></tr>
+        </tbody>
+      </table>
+    </div>
+</div>
+<script type="text/html" id="temprow2-template">
+    <th style="vertical-align: middle" data-bind="text: name"></th>
+    <td style="text-align: right; vertical-align: middle" data-bind="html: formatTemperature(actual())"></td>
+</script>
 
 <!-- Container for custom controls -->
 <div style="clear: both; display: none;" data-bind="visible: loginState.isUser, template: { name: $root.displayMode, foreach: controls }"></div>
