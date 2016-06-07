@@ -25,6 +25,7 @@ Cura/preferences.ini
 build
 dist
 pypy
+env
 OctoPrint.egg-info
 *.orig
 
