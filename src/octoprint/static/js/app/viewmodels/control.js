@@ -111,13 +111,11 @@ $(function() {
             for (var i = 0; i < tools.length; i++) {
                 if (lastData.hasOwnProperty("tool" + i)) {
                     tools[i]["actual"](lastData["tool" + i].actual);
-                    tools[i]["target"](lastData["tool" + i].target);
                 }
             }
 
             if (lastData.hasOwnProperty("bed")) {
                 self.bedTemp["actual"](lastData.bed.actual);
-                self.bedTemp["target"](lastData.bed.target);
             }
         };
 

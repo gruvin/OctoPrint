@@ -103,24 +103,21 @@
     </div>
 </div>
 
-<!-- Temperatures display panel -->
-<div class="jog-panel" style="display: none;" data-bind="visible: loginState.isUser">
-    <h1>{{ _('Temps') }}</h1>
-    <div>
-      <table class="table table-bordered table-hover" style="table-layout: fixed; width: inherit;">
-        <tbody>
-        <tr><th></th><th style="text-align: right; padding-top: 0.1em; padding-bottom: 0.1em">ºC</th></tr>
-          <!-- ko foreach: tools -->
-          <tr data-bind="template: { name: 'temprow2-template' }"></tr>
-          <!-- /ko -->
-          <tr data-bind="template: { name: 'temprow2-template', data: bedTemp }, visible: hasBed"></tr>
-        </tbody>
-      </table>
-    </div>
+<!-- Temperatures display -->
+<div class="well well-small" style="clear: both; margin:0; padding 0 9px; display: none;" data-bind="visible: loginState.isUser">
+  <ul class="inline" style="margin:0">
+    <li>{{ _('Temperatures') }}</li>
+      <!-- ko foreach: tools -->
+      <li data-bind="template: { name: 'templist-template' }"></li>
+      <!-- /ko -->
+      <li data-bind="template: { name: 'templist-template', data: bedTemp }, visible: hasBed"></li>
+  </ul>
 </div>
-<script type="text/html" id="temprow2-template">
-    <th style="vertical-align: middle" data-bind="text: name"></th>
-    <td style="text-align: right; vertical-align: middle" data-bind="html: formatTemperature(actual())"></td>
+<script type="text/html" id="templist-template">
+    <ul class="inline">
+      <li><h5 data-bind="text: name"></h5></li>
+      <li class="text-info" style="text-align: right;" data-bind="html: formatTemperature(actual())"></li>
+    </ul>
 </script>
 
 <!-- Container for custom controls -->
