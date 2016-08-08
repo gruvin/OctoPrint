@@ -94,6 +94,7 @@
         <button class="btn btn-block control-box" data-bind="enable: isOperational() && loginState.isUser(), click: function() { $root.sendFlowRateCommand() }">{{ _('Flow rate:') }}<span data-bind="text: flowRate() + '%'"></span></button>
     </div>
 </div>
+
 <!-- General control panel -->
 <div id="control-jog-general" class="jog-panel" style="display: none;" data-bind="visible: loginState.isUser">
     <h1>{{ _('General') }}</h1>
@@ -103,6 +104,23 @@
         <button class="btn btn-block control-box" data-bind="enable: isOperational() && loginState.isUser(), click: function() { $root.sendCustomCommand({type:'command',command:'M106 S0'}) }">{{ _('Fan off') }}</button>
     </div>
 </div>
+
+<!-- Temperatures display -->
+<div class="well well-small" style="clear: both; margin:0; padding 0 9px; display: none;" data-bind="visible: loginState.isUser">
+  <ul class="inline" style="margin:0">
+    <li>{{ _('Temperatures') }}</li>
+      <!-- ko foreach: tools -->
+      <li data-bind="template: { name: 'templist-template' }"></li>
+      <!-- /ko -->
+      <li data-bind="template: { name: 'templist-template', data: bedTemp }, visible: hasBed"></li>
+  </ul>
+</div>
+<script type="text/html" id="templist-template">
+    <ul class="inline">
+      <li><h5 data-bind="text: name"></h5></li>
+      <li class="text-info" style="text-align: right;" data-bind="html: formatTemperature(actual())"></li>
+    </ul>
+</script>
 
 <!-- Container for custom controls -->
 <div id="control-jog-custom" style="clear: both; display: none;" data-bind="visible: loginState.isUser, template: { name: $root.displayMode, foreach: controls }"></div>
