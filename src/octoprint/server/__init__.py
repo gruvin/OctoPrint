@@ -689,10 +689,10 @@ class Server(object):
 
 		loaders = [app.jinja_loader, filesystem_loader]
 		if octoprint.util.is_running_from_source():
+			from octoprint.util.jinja import SelectedFileSystemLoader
 			root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 			allowed = ["AUTHORS.md", "CHANGELOG.md", "SUPPORTERS.md", "THIRDPARTYLICENSES.md"]
-			files = {"_data/" + name: os.path.join(root, name) for name in allowed}
-			loaders.append(octoprint.util.jinja.SelectedFilesLoader(files))
+			loaders.append(SelectedFileSystemLoader(root, allowed, prefix="_data/"))
 
 		jinja_loader = jinja2.ChoiceLoader(loaders)
 		app.jinja_loader = jinja_loader
@@ -762,10 +762,13 @@ class Server(object):
 							self._logger.info("Preemptively caching {} (plugin {}) for {!r}".format(route, plugin, kwargs))
 						else:
 							self._logger.info("Preemptively caching {} for {!r}".format(route, kwargs))
+
+						headers = kwargs.get("headers", dict())
+						headers["X-Preemptive-Record"] = "no"
+						kwargs["headers"] = headers
+
 						builder = EnvironBuilder(**kwargs)
-						with preemptive_cache.cache_environment(dict(plugin=plugin if plugin is not None else "_default")):
-							with preemptive_cache.disable_access_logging():
-								app(builder.get_environ(), lambda *a, **kw: None)
+						app(builder.get_environ(), lambda *a, **kw: None)
 					except:
 						self._logger.exception("Error while trying to preemptively cache {} for {!r}".format(route, kwargs))
 

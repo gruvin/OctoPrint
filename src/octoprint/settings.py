@@ -1080,12 +1080,23 @@ class Settings(object):
 		if not path:
 			raise NoSuchSettingsPath()
 
-		if config is not None or defaults is not None:
-			if config is None:
-				config = self._config
+		if config is None:
+			config = self._config
+		if defaults is None:
+			defaults = default_settings
+		if preprocessors is None:
+			preprocessors = self._get_preprocessors
 
-			if defaults is None:
-				defaults = dict(self._map.parents)
+		while len(path) > 1:
+			key = path.pop(0)
+			if key in config:
+				config = config[key]
+				defaults = defaults.get(key, dict())
+			elif incl_defaults and key in defaults:
+				config = {}
+				defaults = defaults[key]
+			else:
+				raise NoSuchSettingsPath()
 
 			# mappings: provided config + any intermediary parents + provided defaults + regular defaults
 			mappings = [config] + self._overlay_maps + [defaults, self._default_map]
