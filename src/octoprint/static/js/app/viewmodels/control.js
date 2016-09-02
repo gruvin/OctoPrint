@@ -11,7 +11,12 @@ $(function() {
         self._createToolEntry = function () {
             return {
                 name: ko.observable(),
-                key: ko.observable()
+                key: ko.observable(),
+                actual: ko.observable(0),
+                target: ko.observable(0),
+                offset: ko.observable(0),
+                newTarget: ko.observable(),
+                newOffset: ko.observable()
             }
         };
 
@@ -30,6 +35,10 @@ $(function() {
         self.distance = ko.observable(10);
 
         self.tools = ko.observableArray([]);
+        self.hasBed = ko.observable(true);
+        self.bedTemp = self._createToolEntry();
+        self.bedTemp["name"](gettext("Bed"));
+        self.bedTemp["key"]("bed");
 
         self.feedRate = ko.observable(100);
         self.flowRate = ko.observable(100);
@@ -77,10 +86,12 @@ $(function() {
 
         self.fromCurrentData = function (data) {
             self._processStateData(data.state);
+            self._processTemperatureUpdateData(data.serverTime, data.temps);
         };
 
         self.fromHistoryData = function (data) {
             self._processStateData(data.state);
+            self._processTemperatureUpdateData(data.serverTime, data.temps);
         };
 
         self._processStateData = function (data) {
@@ -91,6 +102,24 @@ $(function() {
             self.isError(data.flags.error);
             self.isReady(data.flags.ready);
             self.isLoading(data.flags.loading);
+        };
+
+        self._processTemperatureUpdateData = function(serverTime, data) {
+            if (data.length == 0)
+                return;
+
+            var lastData = data[data.length - 1];
+
+            var tools = self.tools();
+            for (var i = 0; i < tools.length; i++) {
+                if (lastData.hasOwnProperty("tool" + i)) {
+                    tools[i]["actual"](lastData["tool" + i].actual);
+                }
+            }
+
+            if (lastData.hasOwnProperty("bed")) {
+                self.bedTemp["actual"](lastData.bed.actual);
+            }
         };
 
         self.onEventSettingsUpdated = function (payload) {
