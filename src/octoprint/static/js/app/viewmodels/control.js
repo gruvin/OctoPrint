@@ -12,13 +12,16 @@ $(function() {
             return {
                 name: ko.observable(),
                 key: ko.observable(),
-                actual: ko.observable(0),
-                target: ko.observable(0),
-                offset: ko.observable(0),
-                newTarget: ko.observable(),
-                newOffset: ko.observable()
+                actual: ko.observable(0)
             }
         };
+
+        self.tools = ko.observableArray([]);
+        self.hasBed = ko.observable(true);
+        self.bedTemp = self._createToolEntry();
+        self.bedTemp["name"](gettext("Bed"));
+        self.bedTemp["key"]("bed");
+
 
         self.isErrorOrClosed = ko.observable(undefined);
         self.isOperational = ko.observable(undefined);
@@ -33,12 +36,6 @@ $(function() {
 
         self.distances = ko.observableArray([0.1, 1, 10, 100]);
         self.distance = ko.observable(10);
-
-        self.tools = ko.observableArray([]);
-        self.hasBed = ko.observable(true);
-        self.bedTemp = self._createToolEntry();
-        self.bedTemp["name"](gettext("Bed"));
-        self.bedTemp["key"]("bed");
 
         self.feedRate = ko.observable(100);
         self.flowRate = ko.observable(100);
