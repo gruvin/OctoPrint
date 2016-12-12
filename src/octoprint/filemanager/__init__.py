@@ -211,7 +211,7 @@ class FileManager(object):
 			file_type = get_file_type(path)[-1]
 
 			# we'll use the default printer profile for the backlog since we don't know better
-			queue_entry = QueueEntry(entry, file_type, storage_type, path, self._printer_profile_manager.get_default())
+			queue_entry = QueueEntry(file_name, entry, file_type, storage_type, path, self._printer_profile_manager.get_default())
 			if self._analysis_queue.enqueue(queue_entry, high_priority=False):
 				counter += 1
 		self._logger.info("Added {counter} items from storage type \"{storage_type}\" to analysis queue".format(**locals()))
@@ -224,6 +224,10 @@ class FileManager(object):
 		if not type in self._storage_managers:
 			return
 		del self._storage_managers[type]
+
+	@property
+	def registered_storages(self):
+		return list(self._storage_managers.keys())
 
 	@property
 	def slicing_enabled(self):
@@ -427,7 +431,7 @@ class FileManager(object):
 		            pos=pos,
 		            date=time.time())
 		try:
-			with atomic_write(self._recovery_file) as f:
+			with atomic_write(self._recovery_file, max_permissions=0o666) as f:
 				yaml.safe_dump(data, stream=f, default_flow_style=False, indent="  ", allow_unicode=True)
 		except:
 			self._logger.exception("Could not write recovery data to file {}".format(self._recovery_file))
@@ -480,6 +484,9 @@ class FileManager(object):
 
 	def path_in_storage(self, destination, path):
 		return self._storage(destination).path_in_storage(path)
+
+	def last_modified(self, destination, path=None, recursive=False):
+		return self._storage(destination).last_modified(path=path, recursive=recursive)
 
 	def _storage(self, destination):
 		if not destination in self._storage_managers:

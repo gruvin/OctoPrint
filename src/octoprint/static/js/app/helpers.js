@@ -228,7 +228,7 @@ function ItemListHelper(listType, supportedSorting, supportedFilters, defaultSor
             return;
 
         var filters = self.currentFilters();
-        filters.pop(filter);
+        filters = _.without(filters, filter);
         self.currentFilters(filters);
         self._saveCurrentFiltersToLocalStorage();
 
@@ -242,7 +242,7 @@ function ItemListHelper(listType, supportedSorting, supportedFilters, defaultSor
         // determine comparator
         var comparator = undefined;
         var currentSorting = self.currentSorting();
-        if (typeof currentSorting !== undefined && typeof self.supportedSorting[currentSorting] !== undefined) {
+        if (typeof currentSorting !== 'undefined' && typeof self.supportedSorting[currentSorting] !== 'undefined') {
             comparator = self.supportedSorting[currentSorting];
         }
 
@@ -252,17 +252,17 @@ function ItemListHelper(listType, supportedSorting, supportedFilters, defaultSor
         // filter if necessary
         var filters = self.currentFilters();
         _.each(filters, function(filter) {
-            if (typeof filter !== undefined && typeof supportedFilters[filter] !== undefined)
+            if (typeof filter !== 'undefined' && typeof supportedFilters[filter] !== 'undefined')
                 result = _.filter(result, supportedFilters[filter]);
         });
 
         // search if necessary
-        if (typeof self.searchFunction !== undefined && self.searchFunction) {
+        if (typeof self.searchFunction !== 'undefined' && self.searchFunction) {
             result = _.filter(result, self.searchFunction);
         }
 
         // sort if necessary
-        if (typeof comparator !== undefined)
+        if (typeof comparator !== 'undefined')
             result.sort(comparator);
 
         // set result list
@@ -605,6 +605,175 @@ function splitTextToArray(text, sep, stripEmpty, filter) {
     );
 }
 
+/**
+ * Returns true if comparing data and oldData yields changes, false otherwise.
+ *
+ * E.g.
+ *
+ *   hasDataChanged(
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "three", key: "value"}},
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3", four: "4"}}
+ *   )
+ *
+ * will return
+ *
+ *   true
+ *
+ * and
+ *
+ *   hasDataChanged(
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3"}},
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3"}}
+ *   )
+ *
+ * will return
+ *
+ *   false
+ *
+ * Note that this will assume data and oldData to be structurally identical (same keys)
+ * and is optimized to check for value changes, not key updates.
+ */
+function hasDataChanged(data, oldData) {
+    if (data == undefined) {
+        return false;
+    }
+
+    if (oldData == undefined) {
+        return true;
+    }
+
+    if (_.isPlainObject(data)) {
+        return _.any(_.keys(data), function(key) {return hasDataChanged(data[key], oldData[key]);});
+    } else {
+        return !_.isEqual(data, oldData);
+    }
+}
+
+/**
+ * Compare provided data and oldData plain objects and only return those
+ * substructures of data that actually changed.
+ *
+ * E.g.
+ *
+ *   getOnlyChangedData(
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "three"}},
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3"}}
+ *   )
+ *
+ * will return
+ *
+ *   {fnord: {three: "three"}}
+ *
+ * and
+ *
+ *   getOnlyChangedData(
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3"}},
+ *     {foo: "bar", fnord: {one: "1", two: "2", three: "3"}}
+ *   )
+ *
+ * will return
+ *
+ *   {}
+ *
+ * Note that this will assume data and oldData to be structurally identical (same keys)
+ * and is optimized to check for value changes, not key updates.
+ */
+function getOnlyChangedData(data, oldData) {
+    if (data == undefined) {
+        return {};
+    }
+
+    if (oldData == undefined) {
+        return data;
+    }
+
+    var f = function(root, oldRoot) {
+        if (!_.isPlainObject(root)) {
+            return root;
+        }
+
+        var retval = {};
+        _.forOwn(root, function(value, key) {
+            var oldValue = undefined;
+            if (oldRoot != undefined && oldRoot.hasOwnProperty(key)) {
+                oldValue = oldRoot[key];
+            }
+            if (_.isPlainObject(value)) {
+                if (oldValue == undefined) {
+                    retval[key] = value;
+                } else if (hasDataChanged(value, oldValue)) {
+                    retval[key] = f(value, oldValue);
+                }
+            } else {
+                if (!_.isEqual(value, oldValue)) {
+                    retval[key] = value;
+                }
+            }
+        });
+        return retval;
+    };
+
+    return f(data, oldData);
+}
+
+function callViewModels(allViewModels, method, callback) {
+    callViewModelsIf(allViewModels, method, undefined, callback);
+}
+
+function callViewModelsIf(allViewModels, method, condition, callback) {
+    if (condition == undefined || !_.isFunction(condition)) {
+        condition = function() { return true; };
+    }
+
+    var parameters = undefined;
+    if (!_.isFunction(callback)) {
+        // if callback is not a function that means we are supposed to directly
+        // call the view model method instead of providing it to the callback
+        // - let's figure out how
+
+        if (callback == undefined) {
+            // directly call view model method with no parameters
+            parameters = undefined;
+            log.trace("Calling method", method, "on view models");
+        } else if (_.isArray(callback)) {
+            // directly call view model method with these parameters
+            parameters = callback;
+            log.trace("Calling method", method, "on view models with specified parameters", parameters);
+        } else {
+            // ok, this doesn't make sense, callback is neither undefined nor
+            // an array, we'll return without doing anything
+            return;
+        }
+
+        // we reset this here so we now further down that we want to call
+        // the method directly
+        callback = undefined;
+    } else {
+        log.trace("Providing method", method, "on view models to specified callback", callback);
+    }
+
+    _.each(allViewModels, function(viewModel) {
+        if (viewModel.hasOwnProperty(method) && condition(viewModel, method)) {
+            try {
+                if (callback == undefined) {
+                    if (parameters != undefined) {
+                        // call the method with the provided parameters
+                        viewModel[method].apply(viewModel, parameters);
+                    } else {
+                        // call the method without parameters
+                        viewModel[method]();
+                    }
+                } else {
+                    // provide the method to the callback
+                    callback(viewModel[method], viewModel);
+                }
+            } catch (exc) {
+                log.error("Error calling", method, "on view model", viewModel.constructor.name, ":", (exc.stack || exc));
+            }
+        }
+    });
+}
+
 var sizeObservable = function(observable) {
     return ko.computed({
         read: function() {
@@ -617,4 +786,17 @@ var sizeObservable = function(observable) {
             }
         }
     })
+};
+
+var getQueryParameterByName = function(name, url) {
+    // from http://stackoverflow.com/a/901144/2028598
+    if (!url) {
+      url = window.location.href;
+    }
+    name = name.replace(/[\[\]]/g, "\\$&");
+    var regex = new RegExp("[?&]" + name + "(=([^&#]*)|&|#|$)"),
+        results = regex.exec(url);
+    if (!results) return null;
+    if (!results[2]) return '';
+    return decodeURIComponent(results[2].replace(/\+/g, " "));
 };

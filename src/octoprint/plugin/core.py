@@ -29,6 +29,11 @@ import logging
 import pkg_resources
 import pkginfo
 
+try:
+	from os import scandir
+except ImportError:
+	from scandir import scandir
+
 EntryPointOrigin = namedtuple("EntryPointOrigin", "type, entry_point, module_name, package_name, package_version")
 FolderOrigin = namedtuple("FolderOrigin", "type, folder")
 
@@ -136,6 +141,8 @@ class PluginInfo(object):
 		self._license = license
 
 	def validate(self, phase, additional_validators=None):
+		result = True
+
 		if phase == "before_load":
 			# if the plugin still uses __plugin_init__, log a deprecation warning and move it to __plugin_load__
 			if hasattr(self.instance, self.__class__.attr_init):
@@ -170,7 +177,9 @@ class PluginInfo(object):
 
 		if additional_validators is not None:
 			for validator in additional_validators:
-				validator(phase, self)
+				result = result and validator(phase, self)
+
+		return result
 
 	def __str__(self):
 		if self.version:
@@ -435,6 +444,12 @@ class PluginManager(object):
 
 		if logging_prefix is None:
 			logging_prefix = ""
+		if plugin_folders is None:
+			plugin_folders = []
+		if plugin_types is None:
+			plugin_types = []
+		if plugin_entry_points is None:
+			plugin_entry_points = []
 		if plugin_disabled_list is None:
 			plugin_disabled_list = []
 
@@ -503,13 +518,11 @@ class PluginManager(object):
 				self.logger.warn("Plugin folder {folder} could not be found, skipping it".format(folder=folder))
 				continue
 
-			entries = os.listdir(folder)
-			for entry in entries:
-				path = os.path.join(folder, entry)
-				if os.path.isdir(path) and os.path.isfile(os.path.join(path, "__init__.py")):
-					key = entry
-				elif os.path.isfile(path) and entry.endswith(".py"):
-					key = entry[:-3] # strip off the .py extension
+			for entry in scandir(folder):
+				if entry.is_dir() and os.path.isfile(os.path.join(entry.path, "__init__.py")):
+					key = entry.name
+				elif entry.is_file() and entry.name.endswith(".py"):
+					key = entry.name[:-3] # strip off the .py extension
 				else:
 					continue
 
@@ -582,7 +595,7 @@ class PluginManager(object):
 			else:
 				return None
 		except:
-			self.logger.warn("Could not locate plugin {key}")
+			self.logger.warn("Could not locate plugin {key}".format(key=key))
 			return None
 
 		plugin = self._import_plugin(key, *module, name=name, version=version, summary=summary, author=author, url=url, license=license)
@@ -656,7 +669,9 @@ class PluginManager(object):
 			plugin = self.plugins[name]
 
 		try:
-			plugin.validate("before_load", additional_validators=self.plugin_validators)
+			if not plugin.validate("before_load", additional_validators=self.plugin_validators):
+				return
+
 			plugin.load()
 			plugin.validate("after_load", additional_validators=self.plugin_validators)
 			self.on_plugin_loaded(name, plugin)
@@ -718,6 +733,9 @@ class PluginManager(object):
 			raise PluginCantEnable(name, "Dependency on obsolete hooks detected, full functionality cannot be guaranteed")
 
 		try:
+			if not plugin.validate("before_enable", additional_validators=self.plugin_validators):
+				return False
+
 			plugin.enable()
 			self._activate_plugin(name, plugin)
 		except PluginLifecycleException as e:
@@ -902,6 +920,7 @@ class PluginManager(object):
 				identifier=name,
 				plugin_name=plugin.name,
 				plugin_version=plugin.version,
+				plugin_info=plugin,
 				basefolder=os.path.realpath(plugin.location),
 				logger=logging.getLogger(self.logging_prefix + name),
 				))
@@ -1209,7 +1228,35 @@ class Plugin(object):
 		pass
 
 class RestartNeedingPlugin(Plugin):
-	pass
+	"""
+	Mixin for plugin types that need a restart after enabling/disabling them.
+	"""
+
+class SortablePlugin(Plugin):
+	"""
+	Mixin for plugin types that are sortable.
+	"""
+
+	def get_sorting_key(self, context=None):
+		"""
+		Returns the sorting key to use for the implementation in the specified ``context``.
+
+		May return ``None`` if order is irrelevant.
+
+		Implementations returning None will be ordered by plugin identifier
+		after all implementations which did return a sorting key value that was
+		not None sorted by that.
+
+		Arguments:
+		    context (str): The sorting context for which to provide the
+		        sorting key value.
+
+		Returns:
+		    int or None: An integer signifying the sorting key value of the plugin
+		        (sorting will be done ascending), or None if the implementation
+		        doesn't care about calling order.
+		"""
+		return None
 
 class PluginNeedsRestart(Exception):
 	def __init__(self, name):

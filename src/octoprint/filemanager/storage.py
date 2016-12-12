@@ -9,8 +9,16 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 import logging
 import os
 import pylru
-import tempfile
 import shutil
+
+try:
+	from os import scandir, walk
+except ImportError:
+	from scandir import scandir, walk
+
+from octoprint.util import atomic_write
+from contextlib import contextmanager
+from copy import deepcopy
 
 import octoprint.filemanager
 
@@ -35,6 +43,29 @@ class StorageInterface(object):
 		# empty generator pattern, yield is intentionally unreachable
 		return
 		yield
+
+	def last_modified(self, path=None, recursive=False):
+		"""
+		Get the last modification date of the specified ``path`` or ``path``'s subtree.
+
+		Args:
+		    path (str or None): Path for which to determine the subtree's last modification date. If left out or
+		        set to None, defatuls to storage root.
+		    recursive (bool): Whether to determine only the date of the specified ``path`` (False, default) or
+		        the whole ``path``'s subtree (True).
+
+		Returns: (float) The last modification date of the indicated subtree
+		"""
+		raise NotImplementedError()
+
+	def file_in_path(self, path, filepath):
+		"""
+		Returns whether the file indicated by ``file`` is inside ``path`` or not.
+		:param string path: the path to check
+		:param string filepath: path to the file
+		:return: ``True`` if the file is inside the path, ``False`` otherwise
+		"""
+		return NotImplementedError()
 
 	def file_exists(self, path):
 		"""
@@ -363,23 +394,40 @@ class LocalFileStorage(StorageInterface):
 		metadata = self._get_metadata(path)
 		if not metadata:
 			metadata = dict()
-		for entry in os.listdir(path):
-			if is_hidden_path(entry) or not octoprint.filemanager.valid_file_type(entry):
+		for entry in scandir(path):
+			if is_hidden_path(entry.name) or not octoprint.filemanager.valid_file_type(entry.name):
 				continue
 
-			absolute_path = os.path.join(path, entry)
-			if os.path.isfile(absolute_path):
-				if not entry in metadata or not isinstance(metadata[entry], dict) or not "analysis" in metadata[entry]:
-					printer_profile_rels = self.get_link(absolute_path, "printerprofile")
+			if entry.is_file():
+				if not entry.name in metadata or not isinstance(metadata[entry.name], dict) or not "analysis" in metadata[entry.name]:
+					printer_profile_rels = self.get_link(entry.path, "printerprofile")
 					if printer_profile_rels:
 						printer_profile_id = printer_profile_rels[0]["id"]
 					else:
 						printer_profile_id = None
 
-					yield entry, absolute_path, printer_profile_id
-			elif os.path.isdir(absolute_path):
-				for sub_entry in self._analysis_backlog_generator(absolute_path):
-					yield self.join_path(entry, sub_entry[0]), sub_entry[1], sub_entry[2]
+					yield entry.name, entry.path, printer_profile_id
+			elif os.path.isdir(entry.path):
+				for sub_entry in self._analysis_backlog_generator(entry.path):
+					yield self.join_path(entry.name, sub_entry[0]), sub_entry[1], sub_entry[2]
+
+	def last_modified(self, path=None, recursive=False):
+		if path is None:
+			path = self.basefolder
+		else:
+			path = os.path.join(self.basefolder, path)
+
+		def last_modified_for_path(p):
+			metadata = os.path.join(p, ".metadata.yaml")
+			if os.path.exists(metadata):
+				return max(os.stat(p).st_mtime, os.stat(metadata).st_mtime)
+			else:
+				return os.stat(p).st_mtime
+
+		if recursive:
+			return max(last_modified_for_path(root) for root, _, _ in walk(path))
+		else:
+			return last_modified_for_path(path)
 
 	def file_exists(self, path):
 		path, name = self.sanitize(path)
@@ -391,7 +439,8 @@ class LocalFileStorage(StorageInterface):
 			path = self.sanitize_path(path)
 		else:
 			path = self.basefolder
-		return self._list_folder(path, entry_filter=filter, recursive=recursive)
+			base = ""
+		return self._list_folder(path, base=base, entry_filter=filter, recursive=recursive)
 
 	def add_folder(self, path, ignore_existing=True):
 		path, name = self.sanitize(path)
@@ -412,11 +461,15 @@ class LocalFileStorage(StorageInterface):
 		if not os.path.exists(folder_path):
 			return
 
-		contents = os.listdir(folder_path)
-		if ".metadata.yaml" in contents:
-			contents.remove(".metadata.yaml")
-		if contents and not recursive:
-			raise RuntimeError("{name} in {path} is not empty".format(**locals()))
+		empty = True
+		for entry in scandir(folder_path):
+			if entry.name == ".metadata.yaml":
+				continue
+			empty = False
+			break
+
+		if not empty and not recursive:
+			raise StorageError("{name} in {path} is not empty".format(**locals()), code=StorageError.NOT_EMPTY)
 
 		import shutil
 		shutil.rmtree(folder_path)
@@ -913,7 +966,7 @@ class LocalFileStorage(StorageInterface):
 		if metadata_dirty:
 			self._save_metadata(path, metadata)
 
-	def _list_folder(self, path, entry_filter=None, recursive=True, **kwargs):
+	def _list_folder(self, path, base="", entry_filter=None, recursive=True, **kwargs):
 		if entry_filter is None:
 			entry_filter = kwargs.get("filter", None)
 
@@ -923,57 +976,90 @@ class LocalFileStorage(StorageInterface):
 		metadata_dirty = False
 
 		result = dict()
-		for entry in os.listdir(path):
-			if is_hidden_path(entry):
+		for entry in scandir(path):
+			if is_hidden_path(entry.name):
 				# no hidden files and folders
 				continue
 
-			entry_path = os.path.join(path, entry)
+			entry_name = entry.name
+			entry_path = entry.path
+			entry_is_file = entry.is_file()
+			entry_is_dir = entry.is_dir()
+			entry_stat = entry.stat()
 
 			try:
-				entry, entry_path = self._sanitize_entry(entry, path, entry_path)
+				new_entry_name, new_entry_path = self._sanitize_entry(entry_name, path, entry_path)
+				if entry_name != new_entry_name or entry_path != new_entry_path:
+					entry_name = new_entry_name
+					entry_path = new_entry_path
+					entry_stat = os.stat(entry_path)
 			except:
 				# error while trying to rename the file, we'll continue here and ignore it
 				continue
 
+			path_in_location = entry_name if not base else base + entry_name
+
 			# file handling
-			if os.path.isfile(entry_path):
-				file_type = octoprint.filemanager.get_file_type(entry)
-				if not file_type:
+			if entry_is_file:
+				type_path = octoprint.filemanager.get_file_type(entry_name)
+				if not type_path:
 					# only supported extensions
 					continue
 				else:
 					file_type = file_type[0]
 
-				if entry in metadata and isinstance(metadata[entry], dict):
-					entry_data = metadata[entry]
+				if entry_name in metadata and isinstance(metadata[entry_name], dict):
+					entry_data = metadata[entry_name]
 				else:
-					entry_data = self._add_basic_metadata(path, entry, save=False, metadata=metadata)
+					entry_data = self._add_basic_metadata(path, entry_name, save=False, metadata=metadata)
 					metadata_dirty = True
 
 				# TODO extract model hash from source if possible to recreate link
 
-				if not entry_filter or entry_filter(entry, entry_data):
+				if not entry_filter or entry_filter(entry_name, entry_data):
 					# only add files passing the optional filter
 					extended_entry_data = dict()
 					extended_entry_data.update(entry_data)
-					extended_entry_data["name"] = entry
+					extended_entry_data["name"] = entry_name
+					extended_entry_data["path"] = path_in_location
 					extended_entry_data["type"] = file_type
-					stat = os.stat(entry_path)
+					extended_entry_data["typePath"] = type_path
+					stat = entry_stat
 					if stat:
 						extended_entry_data["size"] = stat.st_size
 						extended_entry_data["date"] = int(stat.st_mtime)
 
-					result[entry] = extended_entry_data
+					result[entry_name] = extended_entry_data
 
 			# folder recursion
-			elif os.path.isdir(entry_path) and recursive:
-				sub_result = self._list_folder(entry_path, entry_filter=entry_filter)
-				result[entry] = dict(
-					name=entry,
+			elif entry_is_dir:
+				entry_data = dict(
+					name=entry_name,
+					path=path_in_location,
 					type="folder",
 					children=sub_result
 				)
+				if recursive:
+					sub_result = self._list_folder(entry_path, base=path_in_location + "/", entry_filter=entry_filter,
+					                               recursive=recursive)
+					entry_data["children"] = sub_result
+
+				if not entry_filter or entry_filter(entry_name, entry_data):
+					def get_size():
+						total_size = 0
+						for element in entry_data["children"].values():
+							if "size" in element:
+								total_size += element["size"]
+
+						return total_size
+
+					# only add folders passing the optional filter
+					extended_entry_data = dict()
+					extended_entry_data.update(entry_data)
+					if recursive:
+						extended_entry_data["size"] = get_size()
+
+					result[entry_name] = extended_entry_data
 
 		# TODO recreate links if we have metadata less entries
 

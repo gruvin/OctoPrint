@@ -17,7 +17,7 @@ import hashlib
 from . import version_checks, updaters, exceptions, util
 
 
-from octoprint.server.util.flask import restricted_access
+from octoprint.server.util.flask import restricted_access, with_revalidation_checking, check_etag
 from octoprint.server import admin_permission, VERSION, REVISION, BRANCH
 from octoprint.util import dict_merge
 import octoprint.settings
@@ -129,7 +129,7 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		octoprint_version = get_versions()["version"]
 		self._version_cache["__version"] = octoprint_version
 
-		with atomic_write(self._version_cache_path) as file_obj:
+		with atomic_write(self._version_cache_path, max_permissions=0o666) as file_obj:
 			yaml.safe_dump(self._version_cache, stream=file_obj, default_flow_style=False, indent="  ", allow_unicode=True)
 
 		self._version_cache_dirty = False
@@ -389,17 +389,46 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		else:
 			check_targets = None
 
-		if "force" in flask.request.values and flask.request.values["force"] in octoprint.settings.valid_boolean_trues:
-			force = True
-		else:
-			force = False
+		force = flask.request.values.get("force", "false") in octoprint.settings.valid_boolean_trues
 
-		try:
-			information, update_available, update_possible = self.get_current_versions(check_targets=check_targets, force=force)
-			return flask.jsonify(dict(status="updatePossible" if update_available and update_possible else "updateAvailable" if update_available else "current",
-			                          information=information))
-		except exceptions.ConfigurationInvalid as e:
-			flask.make_response("Update not properly configured, can't proceed: %s" % e.message, 500)
+		def view():
+			try:
+				information, update_available, update_possible = self.get_current_versions(check_targets=check_targets, force=force)
+				return flask.jsonify(dict(status="updatePossible" if update_available and update_possible else "updateAvailable" if update_available else "current",
+				                          information=information))
+			except exceptions.ConfigurationInvalid as e:
+				return flask.make_response("Update not properly configured, can't proceed: %s" % e.message, 500)
+
+		def etag():
+			checks = self._get_configured_checks()
+
+			targets = check_targets
+			if targets is None:
+				targets = checks.keys()
+
+			import hashlib
+			hash = hashlib.sha1()
+
+			targets = sorted(targets)
+			for target in targets:
+				current_hash = self._get_check_hash(checks.get(target, dict()))
+				if target in self._version_cache and not force:
+					data = self._version_cache[target]
+					hash.update(current_hash)
+					hash.update(str(data["timestamp"] + self._version_cache_ttl >= time.time() > data["timestamp"]))
+					hash.update(repr(data["information"]))
+					hash.update(str(data["available"]))
+					hash.update(str(data["possible"]))
+
+			hash.update(",".join(targets))
+			return hash.hexdigest()
+
+		def condition():
+			return check_etag(etag())
+
+		return with_revalidation_checking(etag_factory=lambda *args, **kwargs: etag(),
+		                                  condition=lambda *args, **kwargs: condition(),
+		                                  unless=lambda: force)(view)()
 
 
 	@octoprint.plugin.BlueprintPlugin.route("/update", methods=["POST"])
@@ -736,9 +765,9 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 		try:
 			util.execute(restart_command)
 		except exceptions.ScriptError as e:
-			self._logger.exception("Error while restarting")
-			self._logger.warn("Restart stdout:\n%s" % e.stdout)
-			self._logger.warn("Restart stderr:\n%s" % e.stderr)
+			self._logger.exception("Error while restarting via command {}".format(restart_command))
+			self._logger.warn("Restart stdout:\n{}".format(e.stdout))
+			self._logger.warn("Restart stderr:\n{}".format(e.stderr))
 			raise exceptions.RestartFailed()
 
 	def _populated_check(self, target, check):
@@ -817,6 +846,17 @@ class SoftwareUpdatePlugin(octoprint.plugin.BlueprintPlugin,
 				result["pip_command"] = self._settings.get(["pip_command"])
 
 		return result
+
+	def _log(self, lines, prefix=None, stream=None, strip=True):
+		if strip:
+			lines = map(lambda x: x.strip(), lines)
+
+		self._send_client_message("loglines", data=dict(loglines=[dict(line=line, stream=stream) for line in lines]))
+		for line in lines:
+			self._console_logger.debug(u"{} {}".format(prefix, line))
+
+	def _send_client_message(self, message_type, data=None):
+		self._plugin_manager.send_plugin_message(self._identifier, dict(type=message_type, data=data))
 
 	def _get_version_checker(self, target, check):
 		"""

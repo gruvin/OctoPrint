@@ -234,7 +234,7 @@ class FilebasedUserManager(UserManager):
 				"settings": user._settings
 			}
 
-		with atomic_write(self._userfile, "wb") as f:
+		with atomic_write(self._userfile, "wb", permissions=0o600, max_permissions=0o666) as f:
 			yaml.safe_dump(data, f, default_flow_style=False, indent="    ", allow_unicode=True)
 			self._dirty = False
 		self._load()
@@ -462,6 +462,10 @@ class User(UserMixin):
 			path = key
 
 		return self._get_setting(path)
+
+	@property
+	def roles(self):
+		return list(self._roles)
 
 	def set_setting(self, key, value):
 		if not isinstance(key, (tuple, list)):

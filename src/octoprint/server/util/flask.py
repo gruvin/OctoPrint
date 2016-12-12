@@ -29,6 +29,10 @@ import octoprint.plugin
 
 from werkzeug.contrib.cache import BaseCache
 
+try:
+	from os import scandir, walk
+except ImportError:
+	from scandir import scandir, walk
 
 #~~ monkey patching
 
@@ -52,12 +56,12 @@ def enable_additional_translations(default_locale="en", additional_folders=None)
 			if not os.path.isdir(dirname):
 				return []
 			result = []
-			for folder in os.listdir(dirname):
-				locale_dir = os.path.join(dirname, folder, 'LC_MESSAGES')
+			for entry in scandir(dirname):
+				locale_dir = os.path.join(entry.path, 'LC_MESSAGES')
 				if not os.path.isdir(locale_dir):
 					continue
-				if filter(lambda x: x.endswith('.mo'), os.listdir(locale_dir)):
-					result.append(Locale.parse(folder))
+				if filter(lambda x: x.name.endswith('.mo'), scandir(locale_dir)):
+					result.append(Locale.parse(entry.name))
 			if not result:
 				result.append(Locale.parse(self._default_locale))
 			return result
@@ -173,7 +177,7 @@ def fix_webassets_cache():
 			f = open(filename, 'rb')
 		except IOError as e:
 			if e.errno != errno.ENOENT:
-				raise
+				error_logger.exception("Got an exception while trying to open webasset file {}".format(filename))
 			return None
 		try:
 			result = f.read()
@@ -232,6 +236,15 @@ class ReverseProxiedEnvironment(object):
 		to_wsgi_format = lambda header: "HTTP_" + header.upper().replace("-", "_")
 		return map(to_wsgi_format, values)
 
+	@staticmethod
+	def valid_ip(address):
+		import netaddr
+		try:
+			netaddr.IPAddress(address)
+			return True
+		except:
+			return False
+
 	def __init__(self,
 	             header_prefix=None,
 	             header_scheme=None,
@@ -286,11 +299,43 @@ class ReverseProxiedEnvironment(object):
 			if host is None:
 				return None, None
 
+			default_port = "443" if scheme == "https" else "80"
+			host = host.strip()
+
 			if ":" in host:
-				server, port = host.split(":", 1)
+				# we might have an ipv6 address here, or a port, or both
+
+				if host[0] == "[":
+					# that looks like an ipv6 address with port, e.g. [fec1::1]:80
+					address_end = host.find("]")
+					if address_end == -1:
+						# no ], that looks like a seriously broken address
+						return None, None
+
+					# extract server ip, skip enclosing [ and ]
+					server = host[1:address_end]
+					tail = host[address_end + 1:]
+
+					# now check if there's also a port
+					if len(tail) and tail[0] == ":":
+						# port included as well
+						port = tail[1:]
+					else:
+						# no port, use default one
+						port = default_port
+
+				elif self.__class__.valid_ip(host):
+					# ipv6 address without port
+					server = host
+					port = default_port
+
+				else:
+					# ipv4 address with port
+					server, port = host.rsplit(":", 1)
+
 			else:
 				server = host
-				port = "443" if scheme == "https" else "80"
+				port = default_port
 
 			return server, port
 
@@ -348,7 +393,12 @@ class ReverseProxiedEnvironment(object):
 				# default port for scheme, can be skipped
 				environ["HTTP_HOST"] = environ["SERVER_NAME"]
 			else:
-				environ["HTTP_HOST"] = environ["SERVER_NAME"] + ":" + environ["SERVER_PORT"]
+				server_name_component = environ["SERVER_NAME"]
+				if ":" in server_name_component and self.__class__.valid_ip(server_name_component):
+					# this is an ipv6 address, we need to wrap that in [ and ] before appending the port
+					server_name_component = "[" + server_name_component + "]"
+
+				environ["HTTP_HOST"] = server_name_component + ":" + environ["SERVER_PORT"]
 
 		# call wrapped app with rewritten environment
 		return environ
@@ -410,12 +460,13 @@ class OctoPrintFlaskResponse(flask.Response):
 		# add request specific cookie suffix to name
 		flask.Response.set_cookie(self, key + flask.request.cookie_suffix, *args, **kwargs)
 
-	def delete_cookie(self, key, *args, **kwargs):
-		# restrict cookie path to script root
-		kwargs["path"] = flask.request.script_root + kwargs.get("path", "/")
+	def delete_cookie(self, key, path='/', domain=None):
+		flask.Response.delete_cookie(self, key, path=path, domain=domain)
 
-		# add request specific cookie suffix to name
-		flask.Response.delete_cookie(self, key + flask.request.cookie_suffix, *args, **kwargs)
+		# we also still might have a cookie left over from before we started prefixing, delete that manually
+		# without any pre processing (no path prefix, no key suffix)
+		flask.Response.set_cookie(self, key, expires=0, max_age=0, path=path, domain=domain)
+
 
 #~~ passive login helper
 
@@ -445,6 +496,8 @@ def passive_login():
 			if netaddr.IPAddress(remoteAddr) in localNetworks:
 				user = octoprint.server.userManager.findUser(autologinAs)
 				if user is not None:
+					user = octoprint.server.userManager.login_user(user)
+					flask.session["usersession.id"] = user.get_session()
 					flask.g.user = user
 					flask.ext.login.login_user(user)
 					flask.ext.principal.identity_changed.send(flask.current_app._get_current_object(), identity=flask.ext.principal.Identity(user.get_id()))
@@ -467,7 +520,9 @@ class LessSimpleCache(BaseCache):
 
 	def __init__(self, threshold=500, default_timeout=300):
 		BaseCache.__init__(self, default_timeout=default_timeout)
+		self._mutex = threading.RLock()
 		self._cache = {}
+		self._bypassed = set()
 		self.clear = self._cache.clear
 		self._threshold = threshold
 
@@ -476,27 +531,35 @@ class LessSimpleCache(BaseCache):
 			now = time.time()
 			for idx, (key, (expires, _)) in enumerate(self._cache.items()):
 				if expires is not None and expires <= now or idx % 3 == 0:
-					self._cache.pop(key, None)
+					with self._mutex:
+						self._cache.pop(key, None)
 
 	def get(self, key):
 		import pickle
 		now = time.time()
-		expires, value = self._cache.get(key, (0, None))
+		with self._mutex:
+			expires, value = self._cache.get(key, (0, None))
 		if expires is None or expires > now:
 			return pickle.loads(value)
 
 	def set(self, key, value, timeout=None):
 		import pickle
-		self._prune()
-		self._cache[key] = (self.calculate_timeout(timeout=timeout),
-		                    pickle.dumps(value, pickle.HIGHEST_PROTOCOL))
+
+		with self._mutex:
+			self._prune()
+			self._cache[key] = (self.calculate_timeout(timeout=timeout),
+								pickle.dumps(value, pickle.HIGHEST_PROTOCOL))
+			if key in self._bypassed:
+				self._bypassed.remove(key)
 
 	def add(self, key, value, timeout=None):
-		self.set(key, value, timeout=None)
-		self._cache.setdefault(key, self._cache[key])
+		with self._mutex:
+			self.set(key, value, timeout=None)
+			self._cache.setdefault(key, self._cache[key])
 
 	def delete(self, key):
-		self._cache.pop(key, None)
+		with self._mutex:
+			self._cache.pop(key, None)
 
 	def calculate_timeout(self, timeout=None):
 		if timeout is None:
@@ -508,7 +571,8 @@ class LessSimpleCache(BaseCache):
 	def over_threshold(self):
 		if self._threshold is None:
 			return False
-		return len(self._cache) > self._threshold
+		with self._mutex:
+			return len(self._cache) > self._threshold
 
 	def __getitem__(self, key):
 		return self.get(key)
@@ -520,7 +584,16 @@ class LessSimpleCache(BaseCache):
 		return self.delete(key)
 
 	def __contains__(self, key):
-		return key in self._cache
+		with self._mutex:
+			return key in self._cache
+
+	def set_bypassed(self, key):
+		with self._mutex:
+			self._bypassed.add(key)
+
+	def is_bypassed(self, key):
+		with self._mutex:
+			return key in self._bypassed
 
 _cache = LessSimpleCache()
 
@@ -530,17 +603,31 @@ def cached(timeout=5 * 60, key=lambda: "view:%s" % flask.request.path, unless=No
 		def decorated_function(*args, **kwargs):
 			logger = logging.getLogger(__name__)
 
+			cache_key = key()
+
+			def f_with_duration(*args, **kwargs):
+				start_time = time.time()
+				try:
+					return f(*args, **kwargs)
+				finally:
+					elapsed = time.time() - start_time
+					logger.debug(
+						"Needed {elapsed:.2f}s to render {path} (key: {key})".format(elapsed=elapsed,
+						                                                             path=flask.request.path,
+						                                                             key=cache_key))
+
 			# bypass the cache if "unless" condition is true
 			if callable(unless) and unless():
 				logger.debug("Cache for {path} bypassed, calling wrapped function".format(path=flask.request.path))
-				return f(*args, **kwargs)
+				_cache.set_bypassed(cache_key)
+				return f_with_duration(*args, **kwargs)
 
 			# also bypass the cache if it's disabled completely
 			if not settings().getBoolean(["devel", "cache", "enabled"]):
 				logger.debug("Cache for {path} disabled, calling wrapped function".format(path=flask.request.path))
-				return f(*args, **kwargs)
+				_cache.set_bypassed(cache_key)
+				return f_with_duration(*args, **kwargs)
 
-			cache_key = key()
 			rv = _cache.get(cache_key)
 
 			# only take the value from the cache if we are not required to refresh it from the wrapped function
@@ -552,11 +639,12 @@ def cached(timeout=5 * 60, key=lambda: "view:%s" % flask.request.path, unless=No
 
 			# get value from wrapped function
 			logger.debug("No cache entry or refreshing cache for {path} (key: {key}), calling wrapped function".format(path=flask.request.path, key=cache_key))
-			rv = f(*args, **kwargs)
+			rv = f_with_duration(*args, **kwargs)
 
 			# do not store if the "unless_response" condition is true
 			if callable(unless_response) and unless_response(rv):
-				logger.debug("Not caching result for {path}, bypassed".format(path=flask.request.path))
+				logger.debug("Not caching result for {path} (key: {key}), bypassed".format(path=flask.request.path, key=cache_key))
+				_cache.set_bypassed(cache_key)
 				return rv
 
 			# store it in the cache
@@ -572,6 +660,11 @@ def is_in_cache(key=lambda: "view:%s" % flask.request.path):
 	if callable(key):
 		key = key()
 	return key in _cache
+
+def is_cache_bypassed(key=lambda: "view:%s" % flask.request.path):
+	if callable(key):
+		key = key()
+	return _cache.is_bypassed(key)
 
 def cache_check_headers():
 	return "no-cache" in flask.request.cache_control or "no-cache" in flask.request.pragma
@@ -593,14 +686,23 @@ def cache_check_response_headers(response):
 
 	return False
 
+def cache_check_status_code(response, valid):
+	if not isinstance(response, flask.Response):
+		return False
+
+	if callable(valid):
+		return not valid(response.status_code)
+	else:
+		return response.status_code not in valid
 
 class PreemptiveCache(object):
 
 	def __init__(self, cachefile):
 		self.cachefile = cachefile
 
-		self._lock = threading.RLock()
 		self._logger = logging.getLogger(__name__ + "." + self.__class__.__name__)
+
+		self._lock = threading.RLock()
 
 	def record(self, data, unless=None, root=None):
 		if callable(unless) and unless():
@@ -682,7 +784,7 @@ class PreemptiveCache(object):
 
 		with self._lock:
 			try:
-				with atomic_write(self.cachefile, "wb") as handle:
+				with atomic_write(self.cachefile, "wb", max_permissions=0o666) as handle:
 					yaml.safe_dump(data, handle,default_flow_style=False, indent="    ", allow_unicode=True)
 			except:
 				self._logger.exception("Error while writing {}".format(self.cachefile))
@@ -808,13 +910,81 @@ def conditional(condition, met):
 	return decorator
 
 
+def with_revalidation_checking(etag_factory=None,
+                               lastmodified_factory=None,
+                               condition=None,
+                               unless=None):
+	if etag_factory is None:
+		def etag_factory(lm=None):
+			return None
+
+	if lastmodified_factory is None:
+		def lastmodified_factory():
+			return None
+
+	if condition is None:
+		def condition(lm=None, etag=None):
+			if lm is None:
+				lm = lastmodified_factory()
+
+			if etag is None:
+				etag = etag_factory(lm=lm)
+
+			return check_lastmodified(lm) and check_etag(etag)
+
+	if unless is None:
+		def unless():
+			return False
+
+	def decorator(f):
+		@functools.wraps(f)
+		def decorated_function(*args, **kwargs):
+			lm = lastmodified_factory()
+			etag = etag_factory(lm)
+
+			if condition(lm, etag) and not unless():
+				return make_response("Not Modified", 304)
+
+			# generate response
+			response = f(*args, **kwargs)
+
+			# set etag header if not already set
+			if etag and response.get_etag()[0] is None:
+				response.set_etag(etag)
+
+			# set last modified header if not already set
+			if lm and response.headers.get("Last-Modified", None) is None:
+				if not isinstance(lm, basestring):
+					from werkzeug.http import http_date
+					lm = http_date(lm)
+				response.headers["Last-Modified"] = lm
+
+			response = add_no_max_age_response_headers(response)
+			return response
+		return decorated_function
+	return decorator
+
+
 def check_etag(etag):
+	if etag is None:
+		return False
+
 	return flask.request.method in ("GET", "HEAD") and \
 	       flask.request.if_none_match and \
 	       etag in flask.request.if_none_match
 
 
 def check_lastmodified(lastmodified):
+	if lastmodified is None:
+		return False
+
+	from datetime import datetime
+	if isinstance(lastmodified, (int, long, float, complex)):
+		lastmodified = datetime.fromtimestamp(lastmodified).replace(microsecond=0)
+
+	if not isinstance(lastmodified, datetime):
+		raise ValueError("lastmodified must be a datetime or float or int instance but, got {} instead".format(lastmodified.__class__))
+
 	return flask.request.method in ("GET", "HEAD") and \
 	       flask.request.if_modified_since and \
 	       lastmodified >= flask.request.if_modified_since
@@ -824,6 +994,11 @@ def add_non_caching_response_headers(response):
 	response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0"
 	response.headers["Pragma"] = "no-cache"
 	response.headers["Expires"] = "-1"
+	return response
+
+
+def add_no_max_age_response_headers(response):
+	response.headers["Cache-Control"] = "max-age=0"
 	return response
 
 
@@ -1104,12 +1279,8 @@ class SettingsCheckUpdater(webassets.updater.BaseUpdater):
 		cache_value = webassets.utils.hash_func(json.dumps(settings().effective_yaml))
 		ctx.cache.set(cache_key, cache_value)
 
-##~~ plugin assets collector
-
-def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
-	logger = logging.getLogger(__name__ + ".collect_plugin_assets")
-
-	supported_stylesheets = ("css", "less")
+##~~ core assets collector
+def collect_core_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
 	assets = dict(
 		js=[],
 		css=[],
@@ -1148,9 +1319,24 @@ def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
 	elif preferred_stylesheet == "css":
 		assets["css"].append('css/octoprint.css')
 
+	return assets
+
+##~~ plugin assets collector
+
+def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
+	logger = logging.getLogger(__name__ + ".collect_plugin_assets")
+
+	supported_stylesheets = ("css", "less")
+	assets = dict(bundled=dict(js=[], css=[], less=[]),
+	              external=dict(js=[], css=[], less=[]))
+
 	asset_plugins = octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.AssetPlugin)
 	for implementation in asset_plugins:
 		name = implementation._identifier
+		is_bundled = implementation._plugin_info.bundled
+
+		asset_key = "bundled" if is_bundled else "external"
+
 		try:
 			all_assets = implementation.get_assets()
 			basefolder = implementation.get_asset_folder()
@@ -1168,13 +1354,13 @@ def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
 			for asset in all_assets["js"]:
 				if not asset_exists("js", asset):
 					continue
-				assets["js"].append('plugin/{name}/{asset}'.format(**locals()))
+				assets[asset_key]["js"].append('plugin/{name}/{asset}'.format(**locals()))
 
 		if preferred_stylesheet in all_assets:
 			for asset in all_assets[preferred_stylesheet]:
 				if not asset_exists(preferred_stylesheet, asset):
 					continue
-				assets[preferred_stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
+				assets[asset_key][preferred_stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
 		else:
 			for stylesheet in supported_stylesheets:
 				if not stylesheet in all_assets:
@@ -1183,7 +1369,7 @@ def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
 				for asset in all_assets[stylesheet]:
 					if not asset_exists(stylesheet, asset):
 						continue
-					assets[stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
+					assets[asset_key][stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
 				break
 
 	return assets

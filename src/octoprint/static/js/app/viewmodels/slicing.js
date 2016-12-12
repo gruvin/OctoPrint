@@ -22,6 +22,8 @@ $(function() {
         self.profiles = ko.observableArray();
         self.printerProfile = ko.observable();
 
+        self.allViewModels = undefined;
+
         self.slicersForFile = function(file) {
             if (file === undefined) {
                 return [];
@@ -207,6 +209,10 @@ $(function() {
             });
 
             self.defaultSlicer = selectedSlicer;
+
+            if (self.allViewModels) {
+                callViewModels(self.allViewModels, "onSlicingData", [data]);
+            }
         };
 
         self.slice = function() {
@@ -260,6 +266,10 @@ $(function() {
 
         self.onEventSettingsUpdated = function(payload) {
             self.requestData();
+        };
+
+        self.onAllBound = function(allViewModels) {
+            self.allViewModels = allViewModels;
         };
     }
 

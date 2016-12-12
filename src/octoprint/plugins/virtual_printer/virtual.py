@@ -45,15 +45,17 @@ class VirtualPrinter(object):
 		self.lastTempAt = time.time()
 		self.bedTemp = 1.0
 		self.bedTargetTemp = 1.0
-		self.speeds = settings().get(["devel", "virtualPrinter", "movementSpeed"])
 
 		self._relative = True
-		self._lastX = None
-		self._lastY = None
-		self._lastZ = None
-		self._lastE = None
+		self._lastX = 0.0
+		self._lastY = 0.0
+		self._lastZ = 0.0
+		self._lastE = 0.0
+		self._lastF = 200
 
 		self._unitModifier = 1
+		self._feedrate_multiplier = 100
+		self._flowrate_multiplier = 100
 
 		self._virtualSd = settings().getBaseFolder("virtualSd")
 		self._sdCardReady = True
@@ -76,6 +78,8 @@ class VirtualPrinter(object):
 		self._echoOnM117 = settings().getBoolean(["devel", "virtualPrinter", "echoOnM117"])
 
 		self._brokenM29 = settings().getBoolean(["devel", "virtualPrinter", "brokenM29"])
+
+		self._firmwareName = settings().get(["devel", "virtualPrinter", "firmwareName"])
 
 		self.currentLine = 0
 		self.lastN = 0
@@ -355,6 +359,155 @@ class VirtualPrinter(object):
 
 		self._logger.info("Closing down read loop")
 
+	##~~ command implementations
+
+	def _gcode_T(self, code, data):
+		self.currentExtruder = int(code)
+		self._send("Active Extruder: %d" % self.currentExtruder)
+
+	def _gcode_F(self, code, data):
+		if self._supportF:
+			self._send("echo:changed F value")
+			return False
+		else:
+			self._send("Error: Unknown command F")
+			return True
+
+	def _gcode_M104(self, data):
+		self._parseHotendCommand(data)
+
+	def _gcode_M109(self, data):
+		self._parseHotendCommand(data, wait=True, support_r=True)
+
+	def _gcode_M140(self, data):
+		self._parseBedCommand(data)
+
+	def _gcode_M190(self, data):
+		self._parseBedCommand(data, wait=True, support_r=True)
+
+	def _gcode_M105(self, data):
+		self._processTemperatureQuery()
+		return True
+
+	def _gcode_M20(self, data):
+		if self._sdCardReady:
+			self._listSd()
+
+	def _gcode_M21(self, data):
+		self._sdCardReady = True
+		self._send("SD card ok")
+
+	def _gcode_M22(self, data):
+		self._sdCardReady = False
+
+	def _gcode_M23(self, data):
+		if self._sdCardReady:
+			filename = data.split(None, 1)[1].strip()
+			self._selectSdFile(filename)
+
+	def _gcode_M24(self, data):
+		if self._sdCardReady:
+			self._startSdPrint()
+
+	def _gcode_M25(self, data):
+		if self._sdCardReady:
+			self._pauseSdPrint()
+
+	def _gcode_M26(self, data):
+		if self._sdCardReady:
+			pos = int(re.search("S([0-9]+)", data).group(1))
+			self._setSdPos(pos)
+
+	def _gcode_M27(self, data):
+		if self._sdCardReady:
+			self._reportSdStatus()
+
+	def _gcode_M28(self, data):
+		if self._sdCardReady:
+			filename = data.split(None, 1)[1].strip()
+			self._writeSdFile(filename)
+
+	def _gcode_M29(self, data):
+		if self._sdCardReady:
+			self._finishSdFile()
+
+	def _gcode_M30(self, data):
+		if self._sdCardReady:
+			filename = data.split(None, 1)[1].strip()
+			self._deleteSdFile(filename)
+
+	def _gcode_M114(self, data):
+		output = "X:{} Y:{} Z:{} E:{} Count: A:{} B:{} C:{}".format(self._lastX, self._lastY, self._lastZ, self._lastE, int(self._lastX*100), int(self._lastY*100), int(self._lastZ*100))
+		if not self._okBeforeCommandOutput:
+			output = "ok " + output
+		self._send(output)
+		return True
+
+	def _gcode_M115(self, data):
+		output = "FIRMWARE_NAME:{} PROTOCOL_VERSION:1.0".format(self._firmwareName)
+		self._send(output)
+
+	def _gcode_M117(self, data):
+		# we'll just use this to echo a message, to allow playing around with pause triggers
+		if self._echoOnM117:
+			self._send("echo:%s" % re.search("M117\s+(.*)", data).group(1))
+
+	def _gcode_M220(self, data):
+		self._feedrate_multiplier = float(re.search('S([0-9]+)', data).group(1))
+
+	def _gcode_M221(self, data):
+		self._flowrate_multiplier = float(re.search('S([0-9]+)', data).group(1))
+
+	def _gcode_M400(self, data):
+		self.buffered.join()
+
+	def _gcode_M999(self, data):
+		# mirror Marlin behaviour
+		self._send("Resend: 1")
+
+	def _gcode_G20(self, data):
+		self._unitModifier = 1.0 / 2.54
+		if self._lastX is not None:
+			self._lastX *= 2.54
+		if self._lastY is not None:
+			self._lastY *= 2.54
+		if self._lastZ is not None:
+			self._lastZ *= 2.54
+		if self._lastE is not None:
+			self._lastE *= 2.54
+
+	def _gcode_G21(self, data):
+		self._unitModifier = 1.0
+		if self._lastX is not None:
+			self._lastX /= 2.54
+		if self._lastY is not None:
+			self._lastY /= 2.54
+		if self._lastZ is not None:
+			self._lastZ /= 2.54
+		if self._lastE is not None:
+			self._lastE /= 2.54
+
+	def _gcode_G90(self, data):
+		self._relative = False
+
+	def _gcode_G91(self, data):
+		self._relative = True
+
+	def _gcode_G92(self, data):
+		self._setPosition(data)
+
+	def _gcode_G28(self, data):
+		self._performMove(data)
+
+	def _gcode_G0(self, data):
+		# simulate reprap buffered commands via a Queue with maxsize which internally simulates the moves
+		self.buffered.put(data)
+	_gcode_G1 = _gcode_G0
+	_gcode_G2 = _gcode_G0
+	_gcode_G3 = _gcode_G0
+
+	##~~ further helpers
+
 	def _calculate_checksum(self, line):
 		checksum = 0
 		for c in line:
@@ -508,22 +661,25 @@ class VirtualPrinter(object):
 
 			if settings().getBoolean(["devel", "virtualPrinter", "includeCurrentToolInTemps"]):
 				if includeTarget:
-					output = "T:%.2f /%.2f %s @:64\n" % (self.temp[self.currentExtruder], self.targetTemp[self.currentExtruder] + 1, allTempsString)
+					output = "T:%.2f /%.2f %s" % (self.temp[self.currentExtruder], self.targetTemp[self.currentExtruder] + 1, allTempsString)
 				else:
-					output = "T:%.2f %s @:64\n" % (self.temp[self.currentExtruder], allTempsString)
+					output = "T:%.2f %s" % (self.temp[self.currentExtruder], allTempsString)
 			else:
-				output = "%s @:64\n" % allTempsString
+				output = allTempsString
 		else:
 			if includeTarget:
-				output = "T:%.2f /%.2f B:%.2f /%.2f @:64\n" % (self.temp[0], self.targetTemp[0], self.bedTemp, self.bedTargetTemp)
+				output = "T:%.2f /%.2f B:%.2f /%.2f" % (self.temp[0], self.targetTemp[0], self.bedTemp, self.bedTargetTemp)
 			else:
-				output = "T:%.2f B:%.2f @:64\n" % (self.temp[0], self.bedTemp)
+				output = "T:%.2f B:%.2f" % (self.temp[0], self.bedTemp)
+
+		output += " @:64\n"
 
 		if includeOk:
 			output = "ok " + output
 		self._output(output)
 
-	def _parseHotendCommand(self, line):
+	def _parseHotendCommand(self, line, wait=False, support_r=False):
+		only_wait_if_higher = True
 		tool = 0
 		toolMatch = re.search('T([0-9]+)', line)
 		if toolMatch:
@@ -538,21 +694,32 @@ class VirtualPrinter(object):
 		try:
 			self.targetTemp[tool] = float(re.search('S([0-9]+)', line).group(1))
 		except:
-			pass
+			if support_r:
+				try:
+					self.targetTemp[tool] = float(re.search('R([0-9]+)', line).group(1))
+					only_wait_if_higher = False
+				except:
+					pass
 
-		if "M109" in line:
-			self._waitForHeatup("tool%d" % tool)
+		if wait:
+			self._waitForHeatup("tool%d" % tool, only_wait_if_higher)
 		if settings().getBoolean(["devel", "virtualPrinter", "repetierStyleTargetTemperature"]):
 			self._output("TargetExtr%d:%d" % (tool, self.targetTemp[tool]))
 
-	def _parseBedCommand(self, line):
+	def _parseBedCommand(self, line, wait=False, support_r=False):
+		only_wait_if_higher = True
 		try:
 			self.bedTargetTemp = float(re.search('S([0-9]+)', line).group(1))
 		except:
-			pass
+			if support_r:
+				try:
+					self.bedTargetTemp = float(re.search('R([0-9]+)', line).group(1))
+					only_wait_if_higher = False
+				except:
+					pass
 
-		if "M190" in line:
-			self._waitForHeatup("bed")
+		if wait:
+			self._waitForHeatup("bed", only_wait_if_higher)
 		if settings().getBoolean(["devel", "virtualPrinter", "repetierStyleTargetTemperature"]):
 			self._output("TargetBed:%d" % self.bedTargetTemp)
 
@@ -561,46 +728,72 @@ class VirtualPrinter(object):
 		matchY = re.search("Y([0-9.]+)", line)
 		matchZ = re.search("Z([0-9.]+)", line)
 		matchE = re.search("E([0-9.]+)", line)
+		matchF = re.search("F([0-9.]+)", line)
 
 		duration = 0
+		if matchF is not None:
+			try:
+				self._lastF = float(matchF.group(1))
+			except:
+				pass
+
+		speedXYZ = self._lastF * (self._feedrate_multiplier / 100.0)
+		speedE = self._lastF * (self._flowrate_multiplier / 100.0)
+
 		if matchX is not None:
 			try:
 				x = float(matchX.group(1))
 				if self._relative or self._lastX is None:
-					duration = max(duration, x * self._unitModifier / float(self.speeds["x"]) * 60.0)
+					duration = max(duration, x * self._unitModifier / speedXYZ * 60.0)
 				else:
-					duration = max(duration, (x - self._lastX) * self._unitModifier / float(self.speeds["x"]) * 60.0)
-				self._lastX = x
+					duration = max(duration, (x - self._lastX) * self._unitModifier / speedXYZ * 60.0)
+
+				if self._relative and self._lastX is not None:
+					self._lastX += x
+				else:
+					self._lastX = x
 			except:
 				pass
 		if matchY is not None:
 			try:
 				y = float(matchY.group(1))
 				if self._relative or self._lastY is None:
-					duration = max(duration, y * self._unitModifier / float(self.speeds["y"]) * 60.0)
+					duration = max(duration, y * self._unitModifier / speedXYZ * 60.0)
 				else:
-					duration = max(duration, (y - self._lastY) * self._unitModifier / float(self.speeds["y"]) * 60.0)
-				self._lastY = y
+					duration = max(duration, (y - self._lastY) * self._unitModifier / speedXYZ * 60.0)
+
+				if self._relative and self._lastY is not None:
+					self._lastY += y
+				else:
+					self._lastY = y
 			except:
 				pass
 		if matchZ is not None:
 			try:
 				z = float(matchZ.group(1))
 				if self._relative or self._lastZ is None:
-					duration = max(duration, z * self._unitModifier / float(self.speeds["z"]) * 60.0)
+					duration = max(duration, z * self._unitModifier / speedXYZ * 60.0)
 				else:
-					duration = max(duration, (z - self._lastZ) * self._unitModifier / float(self.speeds["z"]) * 60.0)
-				self._lastZ = z
+					duration = max(duration, (z - self._lastZ) * self._unitModifier / speedXYZ * 60.0)
+
+				if self._relative and self._lastZ is not None:
+					self._lastZ += z
+				else:
+					self._lastZ = z
 			except:
 				pass
 		if matchE is not None:
 			try:
 				e = float(matchE.group(1))
 				if self._relative or self._lastE is None:
-					duration = max(duration, e * self._unitModifier / float(self.speeds["e"]) * 60.0)
+					duration = max(duration, e * self._unitModifier / speedE * 60.0)
 				else:
-					duration = max(duration, (e - self._lastE) * self._unitModifier / float(self.speeds["e"]) * 60.0)
-				self._lastE = e
+					duration = max(duration, (e - self._lastE) * self._unitModifier / speedE * 60.0)
+
+				if self._relative and self._lastE is not None:
+					self._lastE += e
+				else:
+					self._lastE = e
 			except:
 				pass
 
@@ -717,19 +910,19 @@ class VirtualPrinter(object):
 			self._sdPrinter = None
 			self._output("Done printing file")
 
-	def _waitForHeatup(self, heater):
+	def _waitForHeatup(self, heater, only_wait_if_higher):
 		delta = 1
 		delay = 1
 
 		try:
 			if heater.startswith("tool"):
 				toolNum = int(heater[len("tool"):])
-				while not self._killed and (self.temp[toolNum] < self.targetTemp[toolNum] - delta or self.temp[toolNum] > self.targetTemp[toolNum] + delta):
+				while not self._killed and (self.temp[toolNum] < self.targetTemp[toolNum] - delta or (not only_wait_if_higher and self.temp[toolNum] > self.targetTemp[toolNum] + delta)):
 					self._simulateTemps(delta=delta)
 					self._output("T:%0.2f" % self.temp[toolNum])
 					time.sleep(delay)
 			elif heater == "bed":
-				while not self._killed and (self.bedTemp < self.bedTargetTemp - delta or self.bedTemp > self.bedTargetTemp + delta):
+				while not self._killed and (self.bedTemp < self.bedTargetTemp - delta or (not only_wait_if_higher and self.bedTemp > self.bedTargetTemp + delta)):
 					self._simulateTemps(delta=delta)
 					self._output("B:%0.2f" % self.bedTemp)
 					time.sleep(delay)
@@ -802,8 +995,10 @@ class VirtualPrinter(object):
 				return len(data)
 
 			try:
-				return self.incoming.put(data, timeout=self._write_timeout, partial=True)
-			except Queue.Full:
+				written = self.incoming.put(data, timeout=self._write_timeout, partial=True)
+				self._seriallog.info("<<< {}".format(data.strip()))
+				return written
+			except queue.Full:
 				self._logger.info("Incoming queue is full, raising SerialTimeoutException")
 				raise SerialTimeoutException()
 

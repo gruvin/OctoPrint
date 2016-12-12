@@ -16,27 +16,7 @@ function DataUpdater(allViewModels) {
     self._lastProcessingTimes = [];
     self._lastProcessingTimesSize = 20;
 
-    self._connectCallback = undefined;
-
-    self.connect = function(callback) {
-        var options = {};
-        if (SOCKJS_DEBUG) {
-            options["debug"] = true;
-        }
-
-        self._connectCallback = callback;
-
-        self._socket = new SockJS(SOCKJS_URI, undefined, options);
-        self._socket.onopen = self._onconnect;
-        self._socket.onclose = self._onclose;
-        self._socket.onmessage = self._onmessage;
-    };
-
-    self.reconnect = function() {
-        self._socket.close();
-        delete self._socket;
-        self.connect();
-    };
+    self._safeModePopup = undefined;
 
     self.increaseThrottle = function() {
         self.setThrottle(self._throttleFactor + 1);
@@ -132,11 +112,75 @@ function DataUpdater(allViewModels) {
         $("#offline_overlay_message").html(gettext("The server appears to be offline, at least I'm not getting any response from it. I <strong>could not reconnect automatically</strong>, but you may try a manual reconnect using the button below."));
     };
 
-    self._onmessage = function(e) {
-        for (var prop in e.data) {
-            if (!e.data.hasOwnProperty(prop)) {
-                continue;
-            }
+    self._onConnected = function(event) {
+        var data = event.data;
+
+        // update version information
+        var oldVersion = VERSION;
+        VERSION = data["version"];
+        DISPLAY_VERSION = data["display_version"];
+        BRANCH = data["branch"];
+        $("span.version").text(DISPLAY_VERSION);
+
+        // update plugin hash
+        var oldPluginHash = self._pluginHash;
+        self._pluginHash = data["plugin_hash"];
+
+        // update config hash
+        var oldConfigHash = self._configHash;
+        self._configHash = data["config_hash"];
+
+        // process safe mode
+        if (self._safeModePopup) self._safeModePopup.remove();
+        if (data["safe_mode"]) {
+            // safe mode is active, let's inform the user
+            log.info("Safe mode is active. Third party plugins are disabled and cannot be enabled.");
+
+            self._safeModePopup = new PNotify({
+                title: gettext("Safe mode is active"),
+                text: gettext("The server is currently running in safe mode. Third party plugins are disabled and cannot be enabled."),
+                hide: false
+            });
+        }
+
+        // if the offline overlay is still showing, now's a good time to
+        // hide it, plus reload the camera feed if it's currently displayed
+        if ($("#offline_overlay").is(":visible")) {
+            hideOfflineOverlay();
+            callViewModels(self.allViewModels, "onServerReconnect");
+            callViewModels(self.allViewModels, "onDataUpdaterReconnect");
+        } else {
+            callViewModels(self.allViewModels, "onServerConnect");
+        }
+
+        // if the version, the plugin hash or the config hash changed, we
+        // want the user to reload the UI since it might be stale now
+        var versionChanged = oldVersion != VERSION;
+        var pluginsChanged = oldPluginHash != undefined && oldPluginHash != self._pluginHash;
+        var configChanged = oldConfigHash != undefined && oldConfigHash != self._configHash;
+        if (versionChanged || pluginsChanged || configChanged) {
+            showReloadOverlay();
+        }
+
+        log.info("Connected to the server");
+
+        // if we have a connected promise, resolve it now
+        if (self._connectedDeferred) {
+            self._connectedDeferred.resolve();
+            self._connectedDeferred = undefined;
+        }
+    };
+
+    self._onHistoryData = function(event) {
+        callViewModels(self.allViewModels, "fromHistoryData", [event.data]);
+    };
+
+    self._onCurrentData = function(event) {
+        callViewModels(self.allViewModels, "fromCurrentData", [event.data]);
+    };
+
+    self._onSlicingProgress = function(event) {
+        $("#gcode_upload_progress").find(".bar").text(_.sprintf(gettext("Slicing ... (%(percentage)d%%)"), {percentage: Math.round(event.data["progress"])}));
 
             var data = e.data[prop];
 

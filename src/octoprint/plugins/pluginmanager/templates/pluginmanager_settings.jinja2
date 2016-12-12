@@ -12,19 +12,16 @@
 {% endtrans %}</div>
 {% endmacro %}
 
-{% macro pluginmanager_sudopip() %}
-<div class="alert alert-error" data-bind="visible: pipUseSudo()">{% trans %}
-    The <code>pip</code> command is configured to use <code>sudo</code>. This
-    is <strong>not</strong> recommended due to security reasons. It is <strong>strongly</strong>
-    suggested you install OctoPrint under a
-    <a href="https://github.com/foosel/OctoPrint/#installation">user-owned virtual environment</a>
-    so that the use of <code>sudo</code> is not needed for plugin management.
+{% macro pluginmanager_safemode() %}
+<div class="alert" data-bind="visible: safeMode">{% trans %}
+    Safe mode is currently active. All third party plugins are disabled and cannot be
+    enabled. Installation of plugin packages is disabled.
 {% endtrans %}</div>
 {% endmacro %}
 
 {{ pluginmanager_printing() }}
 {{ pluginmanager_nopip() }}
-{{ pluginmanager_sudopip() }}
+{{ pluginmanager_safemode() }}
 
 <div class="pull-right">
     <button class="btn btn-small" data-bind="click: function() { $root.showPluginSettings(); }" title="{{ _('Plugin Configuration') }}"><i class="icon-wrench"></i></button>
@@ -42,7 +39,7 @@
     <tbody data-bind="foreach: plugins.paginatedItems">
     <tr>
         <td class="settings_plugin_plugin_manager_plugins_name">
-            <div data-bind="css: {muted: !enabled}"><span data-bind="text: name"></span> <span data-bind="visible: version">(<span data-bind="text: version"></span>)</span> <i title="{{ _('Bundled') }}" class="icon-th-large" data-bind="visible: bundled"></i> <i title="Restart needed" class="icon-refresh" data-bind="visible: pending_enable || pending_disable || pending_uninstall"></i> <i title="Uninstalled" class="icon-remove" data-bind="visible: pending_uninstall"></i></div>
+            <div data-bind="css: {muted: !enabled}"><span data-bind="text: name"></span> <span data-bind="visible: version">(<span data-bind="text: version"></span>)</span> <i title="{{ _('Bundled with OctoPrint') }}" class="icon-th-large" data-bind="visible: bundled"></i> <i class="icon-lock" title="{{ _('Cannot be uninstalled through OctoPrint') }}" data-bind="visible: !managable"></i> <i title="{{ _('Restart of OctoPrint needed for changes to take effect') }}" class="icon-refresh" data-bind="visible: pending_enable || pending_disable || pending_install || pending_uninstall"></i> <i title="{{ _('Pending install') }}" class="icon-plus" data-bind="visible: pending_install"></i> <i title="{{ _('Pending uninstall') }}" class="icon-minus" data-bind="visible: pending_uninstall"></i> <i title="{{ _('Disabled due to safe mode') }}" class="icon-medkit" data-bind="visible: safe_mode_victim"></i></div>
             <div><small class="muted" data-bind="text: description">&nbsp;</small></div>
             <div data-bind="css: {muted: !enabled}">
                 <small data-bind="visible: url"><i class="icon-home"></i> <a data-bind="attr: {href: url}" target="_blank" rel="noreferrer noopener">{{ _('Homepage') }}</a></small>
@@ -77,7 +74,6 @@
 
 <div id="settings_plugin_pluginmanager_workingdialog" class="modal hide fade">
     <div class="modal-header">
-        <a href="#" class="close" data-dismiss="modal" aria-hidden="true">&times;</a>
         <h3 data-bind="text: workingTitle"></h3>
     </div>
     <div class="modal-body">
@@ -96,7 +92,7 @@
     <div class="modal-body">
         {{ pluginmanager_printing() }}
         {{ pluginmanager_nopip() }}
-        {{ pluginmanager_sudopip() }}
+        {{ pluginmanager_safemode() }}
         <h4 style="position: relative">
             {{ _('... from the <a href="%(url)s" target="_blank">Plugin Repository</a>', url='http://plugins.octoprint.org') }}
             <a class="dropdown-toggle pull-right" data-toggle="dropdown" href="#">
@@ -169,7 +165,7 @@
                 <div class="input-prepend span9">
                     <span class="btn fileinput-button">
                         <span>{{ _('Browse...') }}</span>
-                        <input id="settings_plugin_pluginmanager_repositorydialog_upload" type="file" name="file" data-url="{{ url_for("plugin.pluginmanager.upload_archive") }}">
+                        <input id="settings_plugin_pluginmanager_repositorydialog_upload" type="file" name="file" accept="{{ ",".join(plugin_pluginmanager_archive_extensions) }}" data-url="{{ url_for("plugin.pluginmanager.upload_archive") }}">
                     </span>
                     <span class="add-on add-on-limited text-left" data-bind="text: uploadFilename, attr: {title: uploadFilename}"></span>
                 </div>

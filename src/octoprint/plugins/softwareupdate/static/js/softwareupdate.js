@@ -1,3 +1,85 @@
+(function (global, factory) {
+    if (typeof define === "function" && define.amd) {
+        define(["OctoPrint"], factory);
+    } else {
+        factory(window.OctoPrint);
+    }
+})(window || this, function(OctoPrint) {
+    var exports = {};
+
+    var url = OctoPrint.getBlueprintUrl("softwareupdate");
+    var checkUrl = url + "check";
+    var updateUrl = url + "update";
+
+    exports.checkEntries = function(entries, force, opts) {
+        if (arguments.length == 1 && _.isObject(arguments[0])) {
+            var params = arguments[0];
+            entries = params.entries;
+            force = params.force;
+            opts = params.opts;
+        }
+
+        entries = entries || [];
+        if (typeof entries == "string") {
+            entries = [entries];
+        }
+
+        var data = {};
+        if (!!force) {
+            data.force = true;
+        }
+        if (entries && entries.length) {
+            data.check = entries.join(",");
+        }
+        return OctoPrint.getWithQuery(checkUrl, data, opts);
+    };
+
+    exports.check = function(force, opts) {
+        if (arguments.length == 1 && _.isObject(arguments[0])) {
+            var params = arguments[0];
+            force = params.force;
+            opts = params.opts;
+        }
+
+        return exports.checkEntries({entries: [], force: force, opts: opts});
+    };
+
+    exports.update = function(entries, force, opts) {
+        if (arguments.length == 1 && _.isObject(arguments[0])) {
+            var params = arguments[0];
+            entries = params.entries;
+            force = params.force;
+            opts = params.opts;
+        }
+
+        entries = entries || [];
+        if (typeof entries == "string") {
+            entries = [entries];
+        }
+
+        var data = {
+            entries: entries,
+            force: !!force
+        };
+        return OctoPrint.postJson(updateUrl, data, opts);
+    };
+
+    exports.updateAll = function(force, opts) {
+        if (arguments.length == 1 && _.isObject(arguments[0])) {
+            var params = arguments[0];
+            force = params.force;
+            opts = params.opts;
+        }
+
+        var data = {
+            force: !!force
+        };
+        return OctoPrint.postJson(updateUrl, data, opts);
+    };
+
+    OctoPrint.plugins.softwareupdate = exports;
+});
+
 $(function() {
     function SoftwareUpdateViewModel(parameters) {
         var self = this;
@@ -14,6 +96,14 @@ $(function() {
         self.restartTimeout = undefined;
 
         self.currentlyBeingUpdated = [];
+
+        self.working = ko.observable(false);
+        self.workingTitle = ko.observable();
+        self.workingDialog = undefined;
+        self.workingOutput = undefined;
+        self.loglines = ko.observableArray([]);
+
+        self.checking = ko.observable(false);
 
         self.octoprintUnconfigured = ko.observable();
         self.octoprintUnreleased = ko.observable();
@@ -231,7 +321,7 @@ $(function() {
                     };
                 }
 
-                if (ignoreSeen || !self._hasNotificationBeenSeen(data.information)) {
+                if ((ignoreSeen || !self._hasNotificationBeenSeen(data.information)) && !OctoPrint.coreui.wizardOpen) {
                     self._showPopup(options, eventListeners);
                 }
             } else if (data.status == "current") {
@@ -249,20 +339,14 @@ $(function() {
 
         self.performCheck = function(showIfNothingNew, force, ignoreSeen) {
             if (!self.loginState.isUser()) return;
-
-            var url = PLUGIN_BASEURL + "softwareupdate/check";
-            if (force) {
-                url += "?force=true";
-            }
-
-            $.ajax({
-                url: url,
-                type: "GET",
-                dataType: "json",
-                success: function(data) {
+            self.checking(true);
+            OctoPrint.plugins.softwareupdate.check(force)
+                .done(function(data) {
                     self.fromCheckResponse(data, ignoreSeen, showIfNothingNew);
-                }
-            });
+                })
+                .always(function() {
+                    self.checking(false);
+                });
         };
 
         self._markNotificationAsSeen = function(data) {
@@ -364,7 +448,64 @@ $(function() {
         self.confirmUpdate = function() {
             self.confirmationDialog.modal("hide");
             self.performUpdate(self.forceUpdate,
-                               _.map(self.availableAndPossible(), function(info) { return info.key }));
+                _.map(self.availableAndPossible(), function(info) { return info.key }));
+        };
+
+        self._showWorkingDialog = function(title) {
+            if (!self.loginState.isAdmin()) {
+                return;
+            }
+
+            self.working(true);
+            self.workingTitle(title);
+            self.workingDialog.modal({keyboard: false, backdrop: "static", show: true});
+        };
+
+        self._markWorking = function(title, line, stream) {
+            if (stream === undefined) {
+                stream = "message";
+            }
+
+            self.loglines.removeAll();
+            self.loglines.push({line: line, stream: stream});
+            self._showWorkingDialog(title);
+        };
+
+        self._markDone = function(line, stream) {
+            if (stream === undefined) {
+                stream = "message";
+            }
+
+            self.working(false);
+            self.loglines.push({line: "", stream: stream});
+            self.loglines.push({line: line, stream: stream});
+            self._scrollWorkingOutputToEnd();
+        };
+
+        self._scrollWorkingOutputToEnd = function() {
+            self.workingOutput.scrollTop(self.workingOutput[0].scrollHeight - self.workingOutput.height());
+        };
+
+        self.onBeforeWizardTabChange = function(next, current) {
+            if (next && _.startsWith(next, "wizard_plugin_softwareupdate")) {
+                // switching to the plugin wizard tab
+                self._copyConfig();
+            } else if (current && _.startsWith(current, "wizard_plugin_softwareupdate")) {
+                // switching away from the plugin wizard tab
+                self._copyConfigBack();
+            }
+
+            return true;
+        };
+
+        self.onAfterWizardFinish = function() {
+            // we might have changed our config, so we need to refresh our check data from the server
+            self.performCheck();
+        };
+
+        self.onStartup = function() {
+            self.workingDialog = $("#settings_plugin_softwareupdate_workingdialog");
+            self.workingOutput = $("#settings_plugin_softwareupdate_workingdialog_output");
         };
 
         self.onServerDisconnect = function() {
@@ -395,6 +536,15 @@ $(function() {
             var options = undefined;
 
             switch (messageType) {
+                case "loglines": {
+                    if (self.working()) {
+                        _.each(messageData.loglines, function(line) {
+                            self.loglines.push(self._preprocessLine(line));
+                        });
+                        self._scrollWorkingOutputToEnd();
+                    }
+                    break;
+                }
                 case "updating": {
                     console.log(JSON.stringify(messageData));
 
@@ -403,6 +553,12 @@ $(function() {
                         name = messageData.target;
                     }
 
+                    text = _.sprintf(gettext("Now updating %(name)s to %(version)s"), {name: messageData.name, version: messageData.version});
+                    self.loglines.push({line: "", stream: "separator"});
+                    self.loglines.push({line: _.repeat("+", text.length), stream: "separator"});
+                    self.loglines.push({line: text, stream: "message"});
+                    self.loglines.push({line: _.repeat("+", text.length), stream: "separator"});
+                    self._scrollWorkingOutputToEnd();
                     self._updatePopup({
                         text: _.sprintf(gettext("Now updating %(name)s to %(version)s"), {name: name, version: messageData.version})
                     });
@@ -420,6 +576,9 @@ $(function() {
                             sticker: false
                         }
                     };
+
+                    self.loglines.push({line: text, stream: "message"});
+                    self._scrollWorkingOutputToEnd();
 
                     self.waitingForRestart = true;
                     self.restartTimeout = setTimeout(function() {
@@ -515,6 +674,13 @@ $(function() {
             }
         };
 
+        self._forcedStdoutLine = /You are using pip version .*?, however version .*? is available\.|You should consider upgrading via the '.*?' command\./;
+        self._preprocessLine = function(line) {
+            if (line.stream == "stderr" && line.line.match(self._forcedStdoutLine)) {
+                line.stream = "stdout";
+            }
+            return line;
+        }
     }
 
     // view model class, parameters for constructor, container to bind to

@@ -194,6 +194,10 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 		if self._comm is not None:
 			self._comm.close()
 		self._printerProfileManager.select(profile)
+
+		from octoprint.logging.handlers import SerialLogHandler
+		SerialLogHandler.on_open_connection()
+
 		self._comm = comm.MachineCom(port, baudrate, callbackObject=self, printerProfileManager=self._printerProfileManager)
 
 	def disconnect(self):
@@ -288,7 +292,7 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 
 	def set_temperature(self, heater, value):
 		if not PrinterInterface.valid_heater_regex.match(heater):
-			raise ValueError("heater must match \"tool[0-9]+\" or \"bed\": {heater}".format(type=heater))
+			raise ValueError("heater must match \"tool[0-9]+\" or \"bed\": {heater}".format(heater=heater))
 
 		if not isinstance(value, (int, long, float)) or value < 0:
 			raise ValueError("value must be a valid number >= 0: {value}".format(value=value))
@@ -363,7 +367,7 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 
 		self._printAfterSelect = printAfterSelect
 		self._posAfterSelect = pos
-		self._comm.selectFile("/" + path if sd and not settings().getBoolean(["feature", "sdRelativePath"]) else path, sd)
+		self._comm.selectFile("/" + path if sd else path, sd)
 		self._setProgressData(completion=0)
 		self._setCurrentZ(None)
 
@@ -374,6 +378,15 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 		self._comm.unselectFile()
 		self._setProgressData(completion=0)
 		self._setCurrentZ(None)
+
+	def get_file_position(self):
+		if self._comm is None:
+			return None
+
+		if self._selectedFile is None:
+			return None
+
+		return self._comm.getFilePosition()
 
 	def start_print(self, pos=None):
 		"""
@@ -448,12 +461,7 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 		# mark print as failure
 		if self._selectedFile is not None:
 			self._fileManager.log_print(FileDestinations.SDCARD if self._selectedFile["sd"] else FileDestinations.LOCAL, self._selectedFile["filename"], time.time(), self._comm.getPrintTime(), False, self._printerProfileManager.get_current_or_default()["id"])
-			payload = {
-				"file": self._selectedFile["filename"],
-				"origin": FileDestinations.LOCAL
-			}
-			if self._selectedFile["sd"]:
-				payload["origin"] = FileDestinations.SDCARD
+			payload = self._payload_for_print_job_event()
 			eventManager().fire(Events.PRINT_FAILED, payload)
 
 	def get_state_string(self):
@@ -715,7 +723,7 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 		"""
 
 		if progress is None or printTime is None or cleanedPrintTime is None:
-			return None
+			return None, None
 
 		dumbTotalPrintTime = printTime / progress
 		estimatedTotalPrintTime = self._estimateTotalPrintTime(progress, cleanedPrintTime)
@@ -911,7 +919,12 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 		self._addLog(to_unicode(message, "utf-8", errors="replace"))
 
 	def on_comm_temperature_update(self, temp, bedTemp):
-		self._addTemperatureData(temp, bedTemp)
+		self._addTemperatureData(copy.deepcopy(temp), copy.deepcopy(bedTemp))
+
+	def on_comm_position_update(self, position, reason=None):
+		payload = dict(reason=reason)
+		payload.update(position)
+		eventManager().fire(Events.POSITION_UPDATE, payload)
 
 	def on_comm_state_change(self, state):
 		"""
@@ -984,11 +997,47 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 			self._printAfterSelect = False
 			self.start_print(pos=self._posAfterSelect)
 
+	def on_comm_print_job_started(self):
+		payload = self._payload_for_print_job_event()
+		if payload:
+			eventManager().fire(Events.PRINT_STARTED, payload)
+			self.script("beforePrintStarted",
+			            context=dict(event=payload),
+			            must_be_set=False)
+
 	def on_comm_print_job_done(self):
 		self._fileManager.log_print(FileDestinations.SDCARD if self._selectedFile["sd"] else FileDestinations.LOCAL, self._selectedFile["filename"], time.time(), self._comm.getPrintTime(), True, self._printerProfileManager.get_current_or_default()["id"])
 		self._setProgressData(completion=1.0, filepos=self._selectedFile["filesize"], printTime=self._comm.getPrintTime(), printTimeLeft=0)
 		self._stateMonitor.set_state({"text": self.get_state_string(), "flags": self._getStateFlags()})
 		self._fileManager.delete_recovery_data()
+
+	def on_comm_print_job_failed(self):
+		payload = self._payload_for_print_job_event()
+		eventManager().fire(Events.PRINT_FAILED, payload)
+
+	def on_comm_print_job_cancelled(self):
+		payload = self._payload_for_print_job_event(position=self._comm.cancel_position.as_dict() if self._comm and self._comm.cancel_position else None)
+		if payload:
+			eventManager().fire(Events.PRINT_CANCELLED, payload)
+			self.script("afterPrintCancelled",
+			            context=dict(event=payload),
+			            must_be_set=False)
+
+	def on_comm_print_job_paused(self):
+		payload = self._payload_for_print_job_event(position=self._comm.pause_position.as_dict() if self._comm and self._comm.pause_position else None)
+		if payload:
+			eventManager().fire(Events.PRINT_PAUSED, payload)
+			self.script("afterPrintPaused",
+			            context=dict(event=payload),
+			            must_be_set=False)
+
+	def on_comm_print_job_resumed(self):
+		payload = self._payload_for_print_job_event()
+		if payload:
+			eventManager().fire(Events.PRINT_RESUMED, payload)
+			self.script("beforePrintResumed",
+			            context=dict(event=payload),
+			            must_be_set=False)
 
 	def on_comm_file_transfer_started(self, filename, filesize):
 		self._sdStreaming = True
@@ -1020,6 +1069,45 @@ class Printer(PrinterInterface, comm.MachineComPrintCallback):
 			pass
 		except:
 			self._logger.exception("Error while trying to persist print recovery data")
+
+	def _payload_for_print_job_event(self, location=None, print_job_file=None, position=None):
+		if print_job_file is None:
+			selected_file = self._selectedFile
+			if not selected_file:
+				return dict()
+
+			print_job_file = selected_file.get("filename", None)
+			location = FileDestinations.SDCARD if selected_file.get("sd", False) else FileDestinations.LOCAL
+
+		if not print_job_file or not location:
+			return dict()
+
+		if location == FileDestinations.SDCARD:
+			full_path = print_job_file
+			if full_path.startswith("/"):
+				full_path = full_path[1:]
+			name = path = full_path
+			origin = FileDestinations.SDCARD
+
+		else:
+			full_path = self._fileManager.path_on_disk(FileDestinations.LOCAL, print_job_file)
+			path = self._fileManager.path_in_storage(FileDestinations.LOCAL, print_job_file)
+			_, name = self._fileManager.split_path(FileDestinations.LOCAL, path)
+			origin = FileDestinations.LOCAL
+
+		result= dict(name=name,
+		             path=path,
+		             origin=origin,
+
+		             # TODO deprecated, remove in 1.4.0
+		             file=full_path,
+		             filename=name)
+
+		if position is not None:
+			result["position"] = position
+
+		return result
+
 
 class StateMonitor(object):
 	def __init__(self, interval=0.5, on_update=None, on_add_temperature=None, on_add_log=None, on_add_message=None, on_get_progress=None):

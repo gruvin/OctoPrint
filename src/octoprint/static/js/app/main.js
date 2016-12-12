@@ -7,13 +7,36 @@ $(function() {
 
         log.setLevel(CONFIG_DEBUG ? "debug" : "info");
 
-        //~~ setup browser and internal tab tracking (in 1.3.0 that will be
-        //   much nicer with the global OctoPrint object...)
+        //~~ OctoPrint client setup
+        OctoPrint.options.baseurl = BASEURL;
+        OctoPrint.options.apikey = UI_API_KEY;
+
+        var l10n = getQueryParameterByName("l10n");
+        if (l10n) {
+            OctoPrint.options.locale = l10n;
+        }
+
+        OctoPrint.socket.onMessage("connected", function(data) {
+            var payload = data.data;
+            OctoPrint.options.apikey = payload.apikey;
+
+            // update the API key directly in jquery's ajax options too,
+            // to ensure the fileupload plugin and any plugins still using
+            // $.ajax directly still work fine too
+            UI_API_KEY = payload["apikey"];
+            $.ajaxSetup({
+                headers: {"X-Api-Key": UI_API_KEY}
+            });
+        });
+
+        //~~ some CoreUI specific stuff we put into OctoPrint.coreui
 
         var tabTracking = (function() {
             var exports = {
                 browserTabVisibility: undefined,
-                selectedTab: undefined
+                selectedTab: undefined,
+                settingsOpen: false,
+                wizardOpen: false
             };
 
             var browserVisibilityCallbacks = [];
@@ -77,9 +100,15 @@ $(function() {
 
         // work around a stupid iOS6 bug where ajax requests get cached and only work once, as described at
         // http://stackoverflow.com/questions/12506897/is-safari-on-ios-6-caching-ajax-results
-        $.ajaxSetup({
-            type: 'POST',
-            headers: { "cache-control": "no-cache" }
+        $.ajaxPrefilter(function(options, originalOptions, jqXHR) {
+            if (options.type != "GET") {
+                var headers;
+                if (options.hasOwnProperty("headers")) {
+                    options.headers["Cache-Control"] = "no-cache";
+                } else {
+                    options.headers = { "Cache-Control": "no-cache" };
+                }
+            }
         });
 
         // send the current UI API key with any request
@@ -226,7 +255,34 @@ $(function() {
             // now try to instantiate every one of our as of yet unprocessed view model descriptors
             while (unprocessedViewModels.length > 0){
                 var viewModel = unprocessedViewModels.shift();
-                var viewModelId = _getViewModelId(viewModel);
+
+                // wrap anything not object related into an object
+                if(!_.isPlainObject(viewModel)) {
+                    viewModel = {
+                        construct: (_.isArray(viewModel)) ? viewModel[0] : viewModel,
+                        dependencies: viewModel[1] || [],
+                        elements: viewModel[2] || [],
+                        optional: viewModel[3] || []
+                    };
+                }
+
+                // make sure we have atleast a function
+                if (!_.isFunction(viewModel.construct)) {
+                    log.error("No function to instantiate with", viewModel);
+                    continue;
+                }
+
+                // if name is not set, get name from constructor, if it's an anonymous function generate one
+                viewModel.name = viewModel.name || _getViewModelId(viewModel.construct.name) || _.uniqueId("unnamedViewModel");
+
+                // no alternative names? empty array
+                viewModel.additionalNames = viewModel.additionalNames || [];
+
+                // make sure all value's are in an array
+                viewModel.dependencies = (_.isArray(viewModel.dependencies)) ? viewModel.dependencies : [viewModel.dependencies];
+                viewModel.elements = (_.isArray(viewModel.elements)) ? viewModel.elements : [viewModel.elements];
+                viewModel.optional = (_.isArray(viewModel.optional)) ? viewModel.optional : [viewModel.optional];
+                viewModel.additionalNames = (_.isArray(viewModel.additionalNames)) ? viewModel.additionalNames : [viewModel.additionalNames];
 
                 // make sure that we don't have two view models going by the same name
                 if (_.has(viewModelMap, viewModelId)) {
@@ -254,7 +310,21 @@ $(function() {
 
                 allViewModelData.push([viewModelInstance, viewModelBindTargets]);
                 allViewModels.push(viewModelInstance);
-                viewModelMap[viewModelId] = viewModelInstance;
+                viewModelMap[viewModel.name] = viewModelInstance;
+
+                if (viewModel.additionalNames.length) {
+                    var registeredAdditionalNames = [];
+                    _.each(viewModel.additionalNames, function(additionalName) {
+                        if (!_.has(viewModelMap, additionalName)) {
+                            viewModelMap[additionalName] = viewModelInstance;
+                            registeredAdditionalNames.push(additionalName);
+                        }
+                    });
+
+                    if (registeredAdditionalNames.length) {
+                        log.debug("Registered", viewModel.name, "under these additional names:", registeredAdditionalNames);
+                    }
+                }
             }
 
             // anything that's now in the postponed list has to be readded to the unprocessedViewModels
@@ -655,10 +725,21 @@ $(function() {
 
             //~~ Starting up the app
 
-            _.each(allViewModels, function(viewModel) {
-                if (viewModel.hasOwnProperty("onStartup")) {
-                    viewModel.onStartup();
-                }
+                viewModelMap["settingsViewModel"].requestData()
+                    .done(function() {
+                        // There appears to be an odd race condition either in JQuery's AJAX implementation or
+                        // the browser's implementation of XHR, causing a second GET request from inside the
+                        // completion handler of the very same request to never get its completion handler called
+                        // if ETag headers are present on the response (the status code of the request does NOT
+                        // seem to matter here, only that the ETag header is present).
+                        //
+                        // Minimal example with which I was able to reproduce this behaviour can be found
+                        // at https://gist.github.com/foosel/b2ddb9ebd71b0b63a749444651bfce3f
+                        //
+                        // Decoupling all consecutive calls from this done event handler hence is an easy way
+                        // to avoid this problem. A zero timeout should do the trick nicely.
+                        window.setTimeout(bindViewModels, 0);
+                    });
             });
 
             viewModelMap["settingsViewModel"].requestData(bindViewModels);

@@ -122,7 +122,12 @@ class Daemon:
 		It will be called after the process has been daemonized by
 		start() or restart()."""
 
-	def remove_pidfile(self):
-		"""Removes the pidfile."""
-		if os.path.isfile(self.pidfile):
-			os.remove(self.pidfile)
+		raise NotImplementedError()
+
+	@classmethod
+	def echo(cls, line):
+		print(line)
+
+	@classmethod
+	def error(cls, line):
+		print(line, file=sys.stderr)

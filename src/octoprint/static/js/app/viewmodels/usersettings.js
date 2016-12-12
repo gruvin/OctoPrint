@@ -82,16 +82,8 @@ $(function() {
             });
         };
 
-        self.updateSettings = function(username, settings, callback) {
-            if (!CONFIG_ACCESS_CONTROL) return;
-
-            $.ajax({
-                url: API_BASEURL + "users/" + username + "/settings",
-                type: "PATCH",
-                contentType: "application/json; charset=UTF-8",
-                data: JSON.stringify(settings),
-                success: callback
-            });
+        self.updateSettings = function(username, settings) {
+            return OctoPrint.users.saveSettings(username, settings);
         };
 
         self.saveEnabled = function() {

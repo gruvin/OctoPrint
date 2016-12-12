@@ -19,7 +19,7 @@ import octoprint.server
 import octoprint.plugin
 from octoprint.server import admin_permission, NO_CONTENT
 from octoprint.settings import settings as s, valid_boolean_trues
-from octoprint.server.util import noCachingResponseHandler, apiKeyRequestHandler, corsResponseHandler
+from octoprint.server.util import noCachingExceptGetResponseHandler, apiKeyRequestHandler, corsResponseHandler
 from octoprint.server.util.flask import restricted_access, get_json_command_from_request, passive_login
 
 
@@ -42,7 +42,7 @@ from . import languages as api_languages
 
 VERSION = "0.1"
 
-api.after_request(noCachingResponseHandler)
+api.after_request(noCachingExceptGetResponseHandler)
 
 api.before_request(apiKeyRequestHandler)
 api.after_request(corsResponseHandler)
@@ -230,3 +230,152 @@ def _logout(user):
 	if "usersession.id" in session:
 		del session["usersession.id"]
 	octoprint.server.userManager.logout_user(user)
+
+@api.route("/util/test", methods=["POST"])
+@restricted_access
+@admin_permission.require(403)
+def utilTestPath():
+	valid_commands = dict(
+		path=["path"],
+		url=["url"]
+	)
+
+	command, data, response = get_json_command_from_request(request, valid_commands)
+	if response is not None:
+		return response
+
+	if command == "path":
+		import os
+		from octoprint.util.paths import normalize
+
+		path = normalize(data["path"])
+		if not path:
+			return jsonify(path=path, exists=False, typeok=False, access=False, result=False)
+
+		check_type = None
+		check_access = []
+
+		if "check_type" in data and data["check_type"] in ("file", "dir"):
+			check_type = data["check_type"]
+
+		if "check_access" in data:
+			request_check_access = data["check_access"]
+			if not isinstance(request_check_access, list):
+				request_check_access = list(request_check_access)
+
+			check_access = [check for check in request_check_access if check in ("r", "w", "x")]
+
+		exists = os.path.exists(path)
+
+		# check if path exists
+		type_mapping = dict(file=os.path.isfile, dir=os.path.isdir)
+		if check_type:
+			typeok = type_mapping[check_type](path)
+		else:
+			typeok = exists
+
+		# check if path allows requested access
+		access_mapping = dict(r=os.R_OK, w=os.W_OK, x=os.X_OK)
+		if check_access:
+			access = os.access(path, reduce(lambda x, y: x | y, map(lambda a: access_mapping[a], check_access)))
+		else:
+			access = exists
+
+		return jsonify(path=path, exists=exists, typeok=typeok, access=access, result=exists and typeok and access)
+
+	elif command == "url":
+		import requests
+
+		class StatusCodeRange(object):
+			def __init__(self, start=None, end=None):
+				self.start = start
+				self.end = end
+
+			def __contains__(self, item):
+				if not isinstance(item, int):
+					return False
+				if self.start and self.end:
+					return self.start <= item < self.end
+				elif self.start:
+					return self.start <= item
+				elif self.end:
+					return item < self.end
+				else:
+					return False
+
+			def as_dict(self):
+				return dict(
+					start=self.start,
+					end=self.end
+				)
+
+		status_ranges = dict(
+			informational=StatusCodeRange(start=100,end=200),
+			success=StatusCodeRange(start=200,end=300),
+			redirection=StatusCodeRange(start=300,end=400),
+			client_error=StatusCodeRange(start=400,end=500),
+			server_error=StatusCodeRange(start=500,end=600),
+			normal=StatusCodeRange(end=400),
+			error=StatusCodeRange(start=400,end=600),
+			any=StatusCodeRange(start=100),
+			timeout=StatusCodeRange(start=0, end=1)
+		)
+
+		url = data["url"]
+		method = data.get("method", "HEAD")
+		timeout = 3.0
+		check_status = [status_ranges["normal"]]
+
+		if "timeout" in data:
+			try:
+				timeout = float(data["timeout"])
+			except:
+				return make_response("{!r} is not a valid value for timeout (must be int or float)".format(data["timeout"]))
+
+		if "status" in data:
+			request_status = data["status"]
+			if not isinstance(request_status, list):
+				request_status = [request_status]
+
+			check_status = []
+			for rs in request_status:
+				if isinstance(rs, int):
+					check_status.append([rs])
+				else:
+					if rs in status_ranges:
+						check_status.append(status_ranges[rs])
+					else:
+						code = requests.codes[rs]
+						if code is not None:
+							check_status.append([code])
+
+		try:
+			response = requests.request(method=method, url=url, timeout=timeout)
+			status = response.status_code
+		except:
+			status = 0
+
+		result = dict(
+			url=url,
+			status=status,
+			result=any(map(lambda x: status in x, check_status))
+		)
+
+		if "response" in data and (data["response"] in valid_boolean_trues or data["response"] in ("json", "bytes")):
+
+			import base64
+			content = base64.standard_b64encode(response.content)
+
+			if data["response"] == "json":
+				try:
+					content = response.json()
+				except:
+					logging.getLogger(__name__).exception("Couldn't convert response to json")
+					result["result"] = False
+
+			result["response"] = dict(
+				headers=dict(response.headers),
+				content=content
+			)
+
+		return jsonify(**result)

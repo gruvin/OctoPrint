@@ -81,6 +81,8 @@ Issue a connection command
      for the lost acknowledgement should always be properly investigated and removed instead of depending on this
      "symptom solver".
 
+   Requires user rights.
+
    **Example Connect Request**
 
    .. sourcecode:: http

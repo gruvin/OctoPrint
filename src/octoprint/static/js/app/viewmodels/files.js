@@ -1,5 +1,5 @@
 $(function() {
-    function GcodeFilesViewModel(parameters) {
+    function FilesViewModel(parameters) {
         var self = this;
 
         self.settingsViewModel = parameters[0];
@@ -150,42 +150,90 @@ $(function() {
         };
 
         self._otherRequestInProgress = undefined;
-        self._filenameToFocus = undefined;
-        self._locationToFocus = undefined;
-        self.requestData = function(filenameToFocus, locationToFocus) {
-            self._filenameToFocus = self._filenameToFocus || filenameToFocus;
-            self._locationToFocus = self._locationToFocus || locationToFocus;
+        self._focus = undefined;
+        self._switchToPath = undefined;
+        self.requestData = function(params) {
+            var focus, switchToPath, force;
+
+            if (_.isObject(params)) {
+                focus = params.focus;
+                switchToPath = params.switchToPath;
+                force = params.force
+            } else if (arguments.length) {
+                // old argument list type call signature
+                log.warn("FilesViewModel.requestData called with old argument list. That is deprecated, please use parameter object instead.");
+                if (arguments.length >= 1) {
+                    if (arguments.length >= 2) {
+                        focus = {location: arguments[1], path: arguments[0]};
+                    } else {
+                        focus = {location: "local", path: arguments[0]};
+                    }
+                }
+                if (arguments.length >= 3) {
+                    switchToPath = arguments[2];
+                }
+                if (arguments.length >= 4) {
+                    force = arguments[3];
+                }
+            }
+
+            self._focus = self._focus || focus;
+            self._switchToPath = self._switchToPath || switchToPath;
+
             if (self._otherRequestInProgress !== undefined) {
                 return self._otherRequestInProgress
             }
 
-            return self._otherRequestInProgress = $.ajax({
-                url: API_BASEURL + "files",
-                method: "GET",
-                dataType: "json"
-            }).done(function(response) {
-                self.fromResponse(response, self._filenameToFocus, self._locationToFocus);
-            }).always(function() {
-                self._otherRequestInProgress = undefined;
-                self._filenameToFocus = undefined;
-                self._locationToFocus = undefined;
-            });
+            return self._otherRequestInProgress = OctoPrint.files.list(true, force)
+                .done(function(response) {
+                    self.fromResponse(response, {focus: self._focus, switchToPath: self._switchToPath});
+                })
+                .always(function() {
+                    self._otherRequestInProgress = undefined;
+                    self._focus = undefined;
+                    self._switchToPath = undefined;
+                });
         };
 
-        self.fromResponse = function(response, filenameToFocus, locationToFocus) {
-            var files = response.files;
-            _.each(files, function(element, index, list) {
-                if (!element.hasOwnProperty("size")) element.size = undefined;
-                if (!element.hasOwnProperty("date")) element.date = undefined;
-            });
-            self.listHelper.updateItems(files);
+        self.fromResponse = function(response, params) {
+            var focus = undefined;
+            var switchToPath;
 
-            if (filenameToFocus) {
-                // got a file to scroll to
-                if (locationToFocus === undefined) {
-                    locationToFocus = "local";
+            if (_.isObject(params)) {
+                focus = params.focus || undefined;
+                switchToPath = params.switchToPath || undefined;
+            } else if (arguments.length > 1) {
+                log.warn("FilesViewModel.requestData called with old argument list. That is deprecated, please use parameter object instead.");
+                if (arguments.length > 2) {
+                    focus = {location: arguments[2], path: arguments[1]};
+                } else {
+                    focus = {location: "local", path: arguments[1]};
                 }
-                var entryElement = self.getEntryElement({name: filenameToFocus, origin: locationToFocus});
+                if (arguments.length > 3) {
+                    switchToPath = arguments[3] || undefined;
+                }
+            }
+
+            var files = response.files;
+
+            self.allItems(files);
+
+            if (!switchToPath) {
+                var currentPath = self.currentPath();
+                if (currentPath === undefined) {
+                    self.listHelper.updateItems(files);
+                    self.currentPath("");
+                } else {
+                    // if we have a current path, make sure we stay on it
+                    self.changeFolderByPath(currentPath);
+                }
+            } else {
+                self.changeFolderByPath(switchToPath);
+            }
+
+            if (focus) {
+                // got a file to scroll to
+                var entryElement = self.getEntryElement({path: focus.path, origin: focus.location});
                 if (entryElement) {
                     // scroll to uploaded element
                     var entryOffset = entryElement.offsetTop;
@@ -211,11 +259,104 @@ $(function() {
                 self.totalSpace(response.total);
             }
 
-            self.highlightFilename(self.printerState.filename());
+            self.highlightCurrentFilename();
+        };
+
+        self.changeFolder = function(data) {
+            self.currentPath(data.path);
+            self.listHelper.updateItems(data.children);
+            self.highlightCurrentFilename();
+        };
+
+        self.navigateUp = function() {
+            var path = self.currentPath().split("/");
+            path.pop();
+            self.changeFolderByPath(path.join("/"));
+        };
+
+        self.changeFolderByPath = function(path) {
+            var element = self.elementByPath(path);
+            if (element) {
+                self.currentPath(path);
+                self.listHelper.updateItems(element.children);
+            } else{
+                self.currentPath("");
+                self.listHelper.updateItems(self.allItems());
+            }
+            self.highlightCurrentFilename();
+        };
+
+        self.showAddFolderDialog = function() {
+            if (self.addFolderDialog) {
+                self.addFolderName("");
+                self.addFolderDialog.modal("show");
+            }
+        };
+
+        self.addFolder = function() {
+            var name = self.addFolderName();
+
+            // "local" only for now since we only support local and sdcard,
+            // and sdcard doesn't support creating folders...
+            var location = "local";
+
+            self.ignoreUpdatedFilesEvent = true;
+            self.addingFolder(true);
+            OctoPrint.files.createFolder(location, name, self.currentPath())
+                .done(function(data) {
+                    self.requestData({
+                        focus: {
+                            path: data.folder.name,
+                            location: data.folder.origin
+                        }
+                    })
+                        .done(function() {
+                            self.addFolderDialog.modal("hide");
+                        })
+                        .always(function() {
+                            self.addingFolder(false);
+                        });
+                })
+                .fail(function() {
+                    self.addingFolder(false);
+                })
+                .always(function() {
+                    self.ignoreUpdatedFilesEvent = false;
+                });
+        };
+
+        self.removeFolder = function(folder, event) {
+            if (!folder) {
+                return;
+            }
+
+            if (folder.type != "folder") {
+                return;
+            }
+
+            if (folder.weight > 0) {
+                // confirm recursive delete
+                var options = {
+                    message: _.sprintf(gettext("You are about to delete the folder \"%(folder)s\" which still contains files and/or sub folders."), {folder: folder.name}),
+                    onproceed: function() {
+                        self._removeEntry(folder, event);
+                    }
+                };
+                showConfirmationDialog(options);
+            } else {
+                self._removeEntry(folder, event);
+            }
         };
 
         self.loadFile = function(file, printAfterLoad) {
-            if (!file || !file.refs || !file.refs.hasOwnProperty("resource")) return;
+            if (!file) {
+                return;
+            }
+            var withinPrintDimensions = self.evaluatePrintDimensions(file, true);
+            var print = printAfterLoad && withinPrintDimensions;
+
+            OctoPrint.files.select(file.origin, file.path, print);
+        };
 
             $.ajax({
                 url: file.refs.resource,
@@ -256,14 +397,54 @@ $(function() {
             self._sendSdCommand("refresh");
         };
 
-        self._sendSdCommand = function(command) {
-            $.ajax({
-                url: API_BASEURL + "printer/sd",
-                type: "POST",
-                dataType: "json",
-                contentType: "application/json; charset=UTF-8",
-                data: JSON.stringify({command: command})
-            });
+        self._removeEntry = function(entry, event) {
+            self.activeRemovals.push(entry.origin + ":" + entry.path);
+            var finishActiveRemoval = function() {
+                self.activeRemovals(_.filter(self.activeRemovals(), function(e) {
+                    return e != entry.origin + ":" + entry.path;
+                }));
+            };
+
+            var activateSpinner = function(){},
+                finishSpinner = function(){};
+
+            if (event) {
+                var element = $(event.currentTarget);
+                if (element.length) {
+                    var icon = $("i.icon-trash", element);
+                    if (icon.length) {
+                        activateSpinner = function() {
+                            icon.removeClass("icon-trash").addClass("icon-spinner icon-spin");
+                        };
+                        finishSpinner = function() {
+                            icon.removeClass("icon-spinner icon-spin").addClass("icon-trash");
+                        };
+                    }
+                }
+            }
+
+            activateSpinner();
+
+            var deferred = $.Deferred();
+            OctoPrint.files.delete(entry.origin, entry.path)
+                .done(function() {
+                    self.requestData()
+                        .done(function() {
+                            deferred.resolve();
+                        })
+                        .fail(function() {
+                            deferred.reject();
+                        });
+                })
+                .fail(function() {
+                    deferred.reject();
+                });
+
+            return deferred.promise()
+                .always(function() {
+                    finishActiveRemoval();
+                    finishSpinner();
+                });
         };
 
         self.downloadLink = function(data) {
@@ -294,7 +475,7 @@ $(function() {
         };
 
         self.getEntryId = function(data) {
-            return "gcode_file_" + md5(data["origin"] + ":" + data["name"]);
+            return "gcode_file_" + md5(data["origin"] + ":" + data["path"]);
         };
 
         self.getEntryElement = function(data) {
@@ -337,6 +518,11 @@ $(function() {
         self.getAdditionalData = function(data) {
             var output = "";
             if (data["gcodeAnalysis"]) {
+                if (data["gcodeAnalysis"]["dimensions"]) {
+                    var dimensions = data["gcodeAnalysis"]["dimensions"];
+                    output += gettext("Model size") + ": " + _.sprintf("%(width).2fmm &times; %(depth).2fmm &times; %(height).2fmm", dimensions);
+                    output += "<br>";
+                }
                 if (data["gcodeAnalysis"]["filament"] && typeof(data["gcodeAnalysis"]["filament"]) == "object") {
                     var filament = data["gcodeAnalysis"]["filament"];
                     if (_.keys(filament).length == 1) {
@@ -353,11 +539,108 @@ $(function() {
             }
             if (data["prints"] && data["prints"]["last"]) {
                 output += gettext("Last printed") + ": " + formatTimeAgo(data["prints"]["last"]["date"]) + "<br>";
-                if (data["prints"]["last"]["lastPrintTime"]) {
-                    output += gettext("Last print time") + ": " + formatDuration(data["prints"]["last"]["lastPrintTime"]);
+                if (data["prints"]["last"]["printTime"]) {
+                    output += gettext("Last print time") + ": " + formatDuration(data["prints"]["last"]["printTime"]);
                 }
             }
             return output;
+        };
+
+        self.evaluatePrintDimensions = function(data, notify) {
+            if (!self.settingsViewModel.feature_modelSizeDetection()) {
+                return true;
+            }
+
+            var analysis = data["gcodeAnalysis"];
+            if (!analysis) {
+                return true;
+            }
+
+            var printingArea = data["gcodeAnalysis"]["printingArea"];
+            if (!printingArea) {
+                return true;
+            }
+
+            var printerProfile = self.printerProfiles.currentProfileData();
+            if (!printerProfile) {
+                return true;
+            }
+
+            var volumeInfo = printerProfile.volume;
+            if (!volumeInfo) {
+                return true;
+            }
+
+            // set print volume boundaries
+            var boundaries;
+            if (_.isPlainObject(volumeInfo.custom_box)) {
+                boundaries = {
+                    minX : volumeInfo.custom_box.x_min(),
+                    minY : volumeInfo.custom_box.y_min(),
+                    minZ : volumeInfo.custom_box.z_min(),
+                    maxX : volumeInfo.custom_box.x_max(),
+                    maxY : volumeInfo.custom_box.y_max(),
+                    maxZ : volumeInfo.custom_box.z_max()
+                }
+            } else {
+                boundaries = {
+                    minX : 0,
+                    maxX : volumeInfo.width(),
+                    minY : 0,
+                    maxY : volumeInfo.depth(),
+                    minZ : 0,
+                    maxZ : volumeInfo.height()
+                };
+                if (volumeInfo.origin() == "center") {
+                    boundaries["maxX"] = volumeInfo.width() / 2;
+                    boundaries["minX"] = -1 * boundaries["maxX"];
+                    boundaries["maxY"] = volumeInfo.depth() / 2;
+                    boundaries["minY"] = -1 * boundaries["maxY"];
+                }
+            }
+
+            // model not within bounds, we need to prepare a warning
+            var warning = "<p>" + _.sprintf(gettext("Object in %(name)s exceeds the print volume of the currently selected printer profile, be careful when printing this."), data) + "</p>";
+            var info = "";
+
+            var formatData = {
+                profile: boundaries,
+                object: printingArea
+            };
+
+            // find exceeded dimensions
+            if (printingArea["minX"] < boundaries["minX"] || printingArea["maxX"] > boundaries["maxX"]) {
+                info += gettext("Object exceeds print volume in width.<br>");
+            }
+            if (printingArea["minY"] < boundaries["minY"] || printingArea["maxY"] > boundaries["maxY"]) {
+                info += gettext("Object exceeds print volume in depth.<br>");
+            }
+            if (printingArea["minZ"] < boundaries["minZ"] || printingArea["maxZ"] > boundaries["maxZ"]) {
+                info += gettext("Object exceeds print volume in height.<br>");
+            }
+
+            //warn user
+            if (info != "") {
+                if (notify) {
+                    info += _.sprintf(gettext("Object's bounding box: (%(object.minX).2f, %(object.minY).2f, %(object.minZ).2f) &times; (%(object.maxX).2f, %(object.maxY).2f, %(object.maxZ).2f)"), formatData);
+                    info += "<br>";
+                    info += _.sprintf(gettext("Print volume: (%(profile.minX).2f, %(profile.minY).2f, %(profile.minZ).2f) &times; (%(profile.maxX).2f, %(profile.maxY).2f, %(profile.maxZ).2f)"), formatData);
+
+                    warning += pnotifyAdditionalInfo(info);
+
+                    warning += "<p><small>You can disable this check via Settings &gt; Features &gt; \"Enable model size detection [...]\"</small></p>";
+
+                    new PNotify({
+                        title: gettext("Object doesn't fit print volume"),
+                        text: warning,
+                        type: "warning",
+                        hide: false
+                    });
+                }
+                return false;
+            } else {
+                return true;
+            }
         };
 
         self.performSearch = function(e) {
@@ -536,7 +819,7 @@ $(function() {
                 type: "success"
             });
 
-            self.requestData(payload.remote, "sdcard");
+            self.requestData({focus: {location: "sdcard", path: payload.remote}});
         };
 
         self.onServerConnect = self.onServerReconnect = function(payload) {
@@ -592,16 +875,13 @@ $(function() {
         };
 
         self._handleUploadDone = function(e, data) {
-            var filename = undefined;
-            var location = undefined;
+            var focus = undefined;
             if (data.result.files.hasOwnProperty("sdcard")) {
-                filename = data.result.files.sdcard.name;
-                location = "sdcard";
+                focus = {location: "sdcard", path: data.result.files.sdcard.path};
             } else if (data.result.files.hasOwnProperty("local")) {
-                filename = data.result.files.local.name;
-                location = "local";
+                focus = {location: "local", path: data.result.files.local.path};
             }
-            self.requestData(filename, location)
+            self.requestData({focus: focus})
                 .done(function() {
                     if (data.result.done) {
                         self.uploadProgressBar
@@ -613,8 +893,8 @@ $(function() {
                     }
                 });
 
-            if (_.endsWith(filename.toLowerCase(), ".stl")) {
-                self.slicing.show(location, filename);
+            if (focus && _.endsWith(focus.path.toLowerCase(), ".stl")) {
+                self.slicing.show(focus.location, focus.path);
             }
         };
 
@@ -719,9 +999,11 @@ $(function() {
         }
     }
 
-    OCTOPRINT_VIEWMODELS.push([
-        GcodeFilesViewModel,
-        ["settingsViewModel", "loginStateViewModel", "printerStateViewModel", "slicingViewModel"],
-        "#files_wrapper"
-    ]);
+    OCTOPRINT_VIEWMODELS.push({
+        construct: FilesViewModel,
+        name: "filesViewModel",
+        additionalNames: ["gcodeFilesViewModel"],
+        dependencies: ["settingsViewModel", "loginStateViewModel", "printerStateViewModel", "slicingViewModel", "printerProfilesViewModel"],
+        elements: ["#files_wrapper", "#add_folder_dialog"],
+    });
 });

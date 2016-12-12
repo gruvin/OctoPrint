@@ -721,8 +721,6 @@ class Profile(object):
 		return pre + str(f)
 
 	def get_gcode(self, key):
-		extruder_count = self.get_int("extruder_amount")
-
 		prefix = ""
 		postfix = ""
 
@@ -733,42 +731,7 @@ class Profile(object):
 
 		if key == "start_gcode":
 			contents = self.get_gcode_template("start_gcode")
-
-			e_steps = self.get_float("steps_per_e")
-			if e_steps > 0:
-				prefix += "M92 E{e_steps}\n" % (e_steps)
-			temp = self.get_float("print_temperature")
-
-			bed_temp = 0
-			if self.get_boolean("has_heated_bed"):
-				bed_temp = self.get_float("print_bed_temperature")
-			include_bed_temp = bed_temp > 0 and not "{print_bed_temperature}" in Profile.regex_strip_comments.sub("", contents)
-
-			if include_bed_temp:
-				prefix += "M140 S{bed_temp}\n".format(bed_temp=bed_temp)
-
-			if temp > 0 and not "{print_temperature}" in Profile.regex_strip_comments.sub("", contents):
-				if extruder_count > 0:
-					def temp_line(temp, extruder, template):
-						t = temp
-						if extruder > 0:
-							print_temp = self.get_float("print_temperature%d" % (extruder + 1))
-							if print_temp > 0:
-								t = print_temp
-						return template.format(extruder=extruder, temp=t)
-
-					prefix_preheat = ""
-					prefix_waitheat = ""
-					for n in xrange(0, extruder_count):
-						if n > 0:
-							prefix_preheat += temp_line(temp, n, "M104 T{extruder} S{temp}\n")
-						prefix_waitheat += temp_line(temp, n, "M109 T{extruder} S{temp}\n")
-					prefix += prefix_preheat + prefix_waitheat + "T0\n"
-				else:
-					prefix += "M109 S{temp}\n".format(temp=temp)
-
-			if include_bed_temp:
-				prefix += "M190 S{bed_temp}\n".format(bed_temp=bed_temp)
+			prefix += self.get_start_gcode_prefix(contents)
 
 		else:
 			contents = self.get_gcode_template(key)
@@ -818,7 +781,7 @@ class Profile(object):
 		return 1
 
 	def get_pos_x(self):
-		if self._posX:
+		if self._posX is not None:
 			try:
 				return int(float(self._posX) * 1000)
 			except ValueError:
@@ -827,7 +790,7 @@ class Profile(object):
 		return int(self.get_float("machine_width") / 2.0 * 1000) if not self.get_boolean("machine_center_is_zero") else 0.0
 
 	def get_pos_y(self):
-		if self._posY:
+		if self._posY is not None:
 			try:
 				return int(float(self._posY) * 1000)
 			except ValueError:
@@ -988,3 +951,21 @@ class Profile(object):
 			settings["enableOozeShield"] = 1
 
 		return settings
+
+
+def parse_gcode_flavor(value):
+
+	value = value.lower()
+
+	if "reprap" in value and ("volume" in value or "volumatric" in value):
+		return GcodeFlavors.REPRAP_VOLUME
+	elif "ultigcode" in value:
+		return GcodeFlavors.ULTIGCODE
+	elif "makerbot" in value:
+		return GcodeFlavors.MAKERBOT
+	elif "bfb" in value:
+		return GcodeFlavors.BFB
+	elif "mach3" in value:
+		return GcodeFlavors.MACH3
+	else:
+		return GcodeFlavors.REPRAP

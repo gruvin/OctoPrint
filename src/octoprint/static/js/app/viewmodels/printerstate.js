@@ -289,7 +289,12 @@ $(function() {
         };
 
         self.cancel = function() {
-            self._jobCommand("cancel");
+            showConfirmationDialog({
+                message: gettext("This will cancel your print."),
+                onproceed: function() {
+                    OctoPrint.job.cancel();
+                }
+            });            
         };
 
         self._jobCommand = function(command, payload, callback) {

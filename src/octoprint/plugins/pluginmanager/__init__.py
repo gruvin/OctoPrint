@@ -10,7 +10,7 @@ import octoprint.plugin
 import octoprint.plugin.core
 
 from octoprint.settings import valid_boolean_trues
-from octoprint.server.util.flask import restricted_access
+from octoprint.server.util.flask import restricted_access, with_revalidation_checking, check_etag
 from octoprint.server import admin_permission, VERSION
 from octoprint.util.pip import PipCaller, UnknownPip
 
@@ -31,6 +31,10 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
                           octoprint.plugin.SettingsPlugin,
                           octoprint.plugin.StartupPlugin,
                           octoprint.plugin.BlueprintPlugin):
+
+	ARCHIVE_EXTENSIONS = (".zip", ".tar.gz", ".tgz", ".tar")
+
+	pip_inapplicable_arguments = dict(uninstall=["--user"])
 
 	def __init__(self):
 		self._pending_enable = set()
@@ -65,7 +69,8 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 	##~~ StartupPlugin
 
 	def on_startup(self, host, port):
-		console_logging_handler = logging.handlers.RotatingFileHandler(self._settings.get_plugin_logfile_path(postfix="console"), maxBytes=2*1024*1024)
+		from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
+		console_logging_handler = CleaningTimedRotatingFileHandler(self._settings.get_plugin_logfile_path(postfix="console"), when="D", backupCount=3)
 		console_logging_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 		console_logging_handler.setLevel(logging.DEBUG)
 
@@ -121,7 +126,8 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		plugins = sorted(self._get_plugins(), key=lambda x: x["name"].lower())
 		return dict(
 			all=plugins,
-			thirdparty=filter(lambda p: not p["bundled"], plugins)
+			thirdparty=filter(lambda p: not p["bundled"], plugins),
+			archive_extensions=self.__class__.ARCHIVE_EXTENSIONS
 		)
 
 	def get_template_types(self, template_sorting, template_rules, *args, **kwargs):
@@ -146,7 +152,7 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		upload_path = flask.request.values[input_upload_path]
 		upload_name = flask.request.values[input_upload_name]
 
-		exts = filter(lambda x: upload_name.lower().endswith(x), (".zip", ".tar.gz", ".tgz", ".tar"))
+		exts = filter(lambda x: upload_name.lower().endswith(x), self.__class__.ARCHIVE_EXTENSIONS)
 		if not len(exts):
 			return flask.make_response("File doesn't have a valid extension for a plugin archive", 400)
 
@@ -182,29 +188,46 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		if not admin_permission.can():
 			return make_response("Insufficient rights", 403)
 
-		plugins = self._plugin_manager.plugins
+		from octoprint.server import safe_mode
 
-		result = []
-		for name, plugin in plugins.items():
-			result.append(self._to_external_representation(plugin))
-
-		if "refresh_repository" in request.values and request.values["refresh_repository"] in valid_boolean_trues:
+		refresh_repository = request.values.get("refresh_repository", "false") in valid_boolean_trues
+		if refresh_repository:
 			self._repository_available = self._refresh_repository()
 
-		return jsonify(plugins=result,
-		               repository=dict(
-		                   available=self._repository_available,
-		                   plugins=self._repository_plugins
-		               ),
-		               os=self._get_os(),
-		               octoprint=VERSION,
-		               pip=dict(
-		                   available=self._pip_caller.available,
-		                   command=self._pip_caller.command,
-		                   version=self._pip_caller.version_string,
-		                   use_sudo=self._pip_caller.use_sudo,
-		                   additional_args=self._settings.get(["pip_args"])
-		               ))
+		def view():
+			return jsonify(plugins=self._get_plugins(),
+			               repository=dict(
+			                   available=self._repository_available,
+			                   plugins=self._repository_plugins
+			               ),
+			               os=self._get_os(),
+			               octoprint=self._get_octoprint_version_string(),
+			               pip=dict(
+			                   available=self._pip_caller.available,
+			                   version=self._pip_caller.version_string,
+			                   install_dir=self._pip_caller.install_dir,
+			                   use_user=self._pip_caller.use_user,
+			                   virtual_env=self._pip_caller.virtual_env,
+			                   additional_args=self._settings.get(["pip_args"]),
+			                   python=sys.executable
+		                    ),
+			               safe_mode=safe_mode)
+
+		def etag():
+			import hashlib
+			hash = hashlib.sha1()
+			hash.update(repr(self._get_plugins()))
+			hash.update(str(self._repository_available))
+			hash.update(repr(self._repository_plugins))
+			hash.update(repr(safe_mode))
+			return hash.hexdigest()
+
+		def condition():
+			return check_etag(etag())
+
+		return with_revalidation_checking(etag_factory=lambda *args, **kwargs: etag(),
+		                                  condition=lambda *args, **kwargs: condition(),
+		                                  unless=lambda: refresh_repository)(view)()
 
 	def on_api_command(self, command, data):
 		if not admin_permission.can():
@@ -430,7 +453,8 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 		needs_refresh = plugin.implementation and isinstance(plugin.implementation, octoprint.plugin.ReloadNeedingPlugin)
 
 		pending = ((command == "disable" and plugin.key in self._pending_enable) or (command == "enable" and plugin.key in self._pending_disable))
-		needs_restart_api = needs_restart and not pending
+		safe_mode_victim = getattr(plugin, "safe_mode_victim", False)
+		needs_restart_api = (needs_restart or safe_mode_victim) and not pending
 		needs_refresh_api = needs_refresh and not pending
 
 		try:
@@ -464,8 +488,15 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 				args.remove("--process-dependency-links")
 
 		additional_args = self._settings.get(["pip_args"])
-		if additional_args:
-			args.append(additional_args)
+
+		if additional_args is not None:
+
+			inapplicable_arguments = self.__class__.pip_inapplicable_arguments.get(args[0], list())
+			for inapplicable_argument in inapplicable_arguments:
+				additional_args = re.sub("(^|\s)" + re.escape(inapplicable_argument) + "\\b", "", additional_args)
+
+			if additional_args:
+				args.append(additional_args)
 
 		return self._pip_caller.execute(*args)
 
@@ -496,12 +527,12 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 			self._settings.global_set(["plugins", "_disabled"], disabled_list)
 			self._settings.save(force=True)
 
-		if not needs_restart:
+		if not needs_restart and not getattr(plugin, "safe_mode_victim", False):
 			self._plugin_manager.enable_plugin(plugin.key)
 		else:
 			if plugin.key in self._pending_disable:
 				self._pending_disable.remove(plugin.key)
-			elif not plugin.enabled and plugin.key not in self._pending_enable:
+			elif (not plugin.enabled and not getattr(plugin, "safe_mode_enabled", False)) and plugin.key not in self._pending_enable:
 				self._pending_enable.add(plugin.key)
 
 	def _mark_plugin_disabled(self, plugin, needs_restart=False):
@@ -511,12 +542,12 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 			self._settings.global_set(["plugins", "_disabled"], disabled_list)
 			self._settings.save(force=True)
 
-		if not needs_restart:
+		if not needs_restart and not getattr(plugin, "safe_mode_victim", False):
 			self._plugin_manager.disable_plugin(plugin.key)
 		else:
 			if plugin.key in self._pending_enable:
 				self._pending_enable.remove(plugin.key)
-			elif plugin.enabled and plugin.key not in self._pending_disable:
+			elif (plugin.enabled or getattr(plugin, "safe_mode_enabled", False)) and plugin.key not in self._pending_disable:
 				self._pending_disable.add(plugin.key)
 
 	def _fetch_repository_from_disk(self):
@@ -669,10 +700,12 @@ class PluginManagerPlugin(octoprint.plugin.SimpleApiPlugin,
 			license=plugin.license,
 			bundled=plugin.bundled,
 			enabled=plugin.enabled,
-			pending_enable=(not plugin.enabled and plugin.key in self._pending_enable),
-			pending_disable=(plugin.enabled and plugin.key in self._pending_disable),
-			pending_install=(plugin.key in self._pending_install),
-			pending_uninstall=(plugin.key in self._pending_uninstall),
+			safe_mode_victim=getattr(plugin, "safe_mode_victim", False),
+			safe_mode_enabled=getattr(plugin, "safe_mode_enabled", False),
+			pending_enable=(not plugin.enabled and not getattr(plugin, "safe_mode_enabled", False) and plugin.key in self._pending_enable),
+			pending_disable=((plugin.enabled or getattr(plugin, "safe_mode_enabled", False)) and plugin.key in self._pending_disable),
+			pending_install=(self._plugin_manager.is_plugin_marked(plugin.key, "installed")),
+			pending_uninstall=(self._plugin_manager.is_plugin_marked(plugin.key, "uninstalled")),
 			origin=plugin.origin.type
 		)
 

@@ -68,13 +68,16 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection, octoprint.printer.
 		plugin_hash.update(",".join(ui_plugins))
 
 		# connected => update the API key, might be necessary if the client was left open while the server restarted
-		self._emit("connected", {
-			"apikey": octoprint.server.UI_API_KEY,
-			"version": octoprint.server.VERSION,
-			"display_version": octoprint.server.DISPLAY_VERSION,
-			"branch": octoprint.server.BRANCH,
-			"plugin_hash": plugin_hash.hexdigest()
-		})
+		self._emit("connected", dict(
+			apikey=octoprint.server.UI_API_KEY,
+			version=octoprint.server.VERSION,
+			display_version=octoprint.server.DISPLAY_VERSION,
+			branch=octoprint.server.BRANCH,
+			plugin_hash=plugin_hash.hexdigest(),
+			config_hash=config_hash,
+			debug=octoprint.server.debug,
+			safe_mode=octoprint.server.safe_mode
+		))
 
 		self._printer.register_callback(self)
 		self._fileManager.register_slicingprogress_callback(self)
@@ -203,4 +206,7 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection, octoprint.printer.
 			try:
 				self.send({type: payload})
 			except Exception as e:
-				self._logger.warn("Could not send message to client %s: %s" % (self._remoteAddress, str(e)))
+				if self._logger.isEnabledFor(logging.DEBUG):
+					self._logger.exception("Could not send message to client {}".format(self._remoteAddress))
+				else:
+					self._logger.warn("Could not send message to client {}: {}".format(self._remoteAddress, e))

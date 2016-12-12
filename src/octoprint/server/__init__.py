@@ -32,6 +32,7 @@ app = Flask("octoprint")
 assets = None
 babel = None
 debug = False
+safe_mode = False
 
 printer = None
 printerProfileManager = None
@@ -113,14 +114,15 @@ def load_user(id):
 
 
 class Server(object):
-	def __init__(self, configfile=None, basedir=None, host="0.0.0.0", port=5000, debug=False, allowRoot=False, logConf=None, octoprint_daemon=None):
-		self._configfile = configfile
-		self._basedir = basedir
+	def __init__(self, settings=None, plugin_manager=None, host="0.0.0.0", port=5000, debug=False, safe_mode=False, allow_root=False, octoprint_daemon=None):
+		self._settings = settings
+		self._plugin_manager = plugin_manager
 		self._host = host
 		self._port = port
 		self._debug = debug
-		self._allowRoot = allowRoot
-		self._logConf = logConf
+		self._safe_mode = safe_mode
+		self._allow_root = allow_root
+		self._octoprint_daemon = octoprint_daemon
 		self._server = None
 		self._octoprint_daemon = octoprint_daemon
 
@@ -152,6 +154,7 @@ class Server(object):
 		global pluginLifecycleManager
 		global preemptiveCache
 		global debug
+		global safe_mode
 
 		from tornado.ioloop import IOLoop
 		from tornado.web import Application, RequestHandler
@@ -159,6 +162,7 @@ class Server(object):
 		import sys
 
 		debug = self._debug
+		safe_mode = self._safe_mode
 
 		# first initialize the settings singleton and make sure it uses given configfile and basedir if available
 		s = settings(init=True, basedir=self._basedir, configfile=self._configfile)
@@ -173,13 +177,9 @@ class Server(object):
 		# setup i18n
 		self._setup_i18n(app)
 
-		# then initialize logging
-		self._setup_logging(self._debug, self._logConf)
-		self._logger = logging.getLogger(__name__)
-		def exception_logger(exc_type, exc_value, exc_tb):
-			self._logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
-		sys.excepthook = exception_logger
-		self._logger.info("Starting OctoPrint %s" % DISPLAY_VERSION)
+		if self._settings.getBoolean(["serial", "log"]):
+			# enable debug logging to serial.log
+			logging.getLogger("SERIAL").setLevel(logging.DEBUG)
 
 		# start the intermediary server
 		self._start_intermediary_server(s)
@@ -199,43 +199,30 @@ class Server(object):
 		pluginLifecycleManager = LifecycleManager(pluginManager)
 		preemptiveCache = PreemptiveCache(os.path.join(s.getBaseFolder("data"), "preemptive_cache_config.yaml"))
 
-		# ... and initialize all plugins
-
 		def octoprint_plugin_inject_factory(name, implementation):
 			"""Factory for injections for all OctoPrintPlugins"""
-
 			if not isinstance(implementation, octoprint.plugin.OctoPrintPlugin):
-				# we only care about OctoPrintPlugins
 				return None
-
-			return dict(
-				plugin_manager=pluginManager,
-				printer_profile_manager=printerProfileManager,
-				event_bus=eventManager,
-				analysis_queue=analysisQueue,
-				slicing_manager=slicingManager,
-				file_manager=fileManager,
-				printer=printer,
-				app_session_manager=appSessionManager,
-				plugin_lifecycle_manager=pluginLifecycleManager,
-				data_folder=os.path.join(settings().getBaseFolder("data"), name),
-				preemptive_cache=preemptiveCache
-			)
+			props = dict()
+			props.update(components)
+			props.update(dict(
+				data_folder=os.path.join(self._settings.getBaseFolder("data"), name)
+			))
+			return props
 
 		def settings_plugin_inject_factory(name, implementation):
-			"""Factory for additional injections depending on plugin type"""
-
+			"""Factory for additional injections/initializations depending on plugin type"""
 			if not isinstance(implementation, octoprint.plugin.SettingsPlugin):
-				# we only care about SettingsPlugins
-				return None
+				return
 
-			# SettingsPlugin instnances get a PluginSettings instance injected
-			default_settings = implementation.get_settings_defaults()
-			get_preprocessors, set_preprocessors = implementation.get_settings_preprocessors()
-			plugin_settings = octoprint.plugin.plugin_settings(name,
-			                                                   defaults=default_settings,
-			                                                   get_preprocessors=get_preprocessors,
-			                                                   set_preprocessors=set_preprocessors)
+			default_settings_overlay = dict(plugins=dict())
+			default_settings_overlay["plugins"][name] = implementation.get_settings_defaults()
+			self._settings.add_overlay(default_settings_overlay, at_end=True)
+
+			plugin_settings = octoprint.plugin.plugin_settings_for_settings_plugin(name, implementation)
+			if plugin_settings is None:
+				return
+
 			return dict(settings=plugin_settings)
 
 		def settings_plugin_config_migration_and_cleanup(name, implementation):
@@ -258,7 +245,8 @@ class Server(object):
 
 			implementation.on_settings_initialized()
 
-		pluginManager.implementation_inject_factories=[octoprint_plugin_inject_factory, settings_plugin_inject_factory]
+		pluginManager.implementation_inject_factories=[octoprint_plugin_inject_factory,
+		                                               settings_plugin_inject_factory]
 		pluginManager.initialize_implementations()
 
 		settingsPlugins = pluginManager.get_implementations(octoprint.plugin.SettingsPlugin)
@@ -306,17 +294,6 @@ class Server(object):
 		if self._debug:
 			events.DebugEventListener()
 
-		# setup access control
-		userManagerName = s.get(["accessControl", "userManager"])
-		try:
-			clazz = octoprint.util.get_class(userManagerName)
-			userManager = clazz()
-		except AttributeError as e:
-			self._logger.exception("Could not instantiate user manager {}, falling back to FilebasedUserManager!".format(userManagerName))
-			userManager = octoprint.users.FilebasedUserManager()
-		finally:
-			userManager.enabled = s.getBoolean(["accessControl", "enabled"])
-
 		loginManager = LoginManager()
 		loginManager.session_protection = "strong"
 		loginManager.user_callback = load_user
@@ -331,9 +308,9 @@ class Server(object):
 		## Tornado initialization starts here
 
 		if self._host is None:
-			self._host = s.get(["server", "host"])
+			self._host = self._settings.get(["server", "host"])
 		if self._port is None:
-			self._port = s.getInt(["server", "port"])
+			self._port = self._settings.getInt(["server", "port"])
 
 		ioloop = IOLoop()
 		ioloop.install()
@@ -432,14 +409,14 @@ class Server(object):
 		self._stop_intermediary_server()
 
 		# initialize and bind the server
-		self._server = util.tornado.CustomHTTPServer(self._tornado_app, max_body_sizes=max_body_sizes, default_max_body_size=s.getInt(["server", "maxSize"]))
+		self._server = util.tornado.CustomHTTPServer(self._tornado_app, max_body_sizes=max_body_sizes, default_max_body_size=self._settings.getInt(["server", "maxSize"]))
 		self._server.listen(self._port, address=self._host)
 
 		eventManager.fire(events.Events.STARTUP)
 
 		# auto connect
-		if s.getBoolean(["serial", "autoconnect"]):
-			(port, baudrate) = s.get(["serial", "port"]), s.getInt(["serial", "baudrate"])
+		if self._settings.getBoolean(["serial", "autoconnect"]):
+			(port, baudrate) = self._settings.get(["serial", "port"]), self._settings.getInt(["serial", "baudrate"])
 			printer_profile = printerProfileManager.get_default()
 			connectionOptions = get_connection_options()
 			if port in connectionOptions["ports"]:
@@ -470,6 +447,11 @@ class Server(object):
 		# prepare our after startup function
 		def on_after_startup():
 			self._logger.info("Listening on http://%s:%d" % (self._host, self._port))
+
+			if safe_mode and self._settings.getBoolean(["server", "startOnceInSafeMode"]):
+				self._logger.info("Server started successfully in safe mode as requested from config, removing flag")
+				self._settings.setBoolean(["server", "startOnceInSafeMode"], False)
+				self._settings.save()
 
 			# now this is somewhat ugly, but the issue is the following: startup plugins might want to do things for
 			# which they need the server to be already alive (e.g. for being able to resolve urls, such as favicons
@@ -502,8 +484,14 @@ class Server(object):
 			self._logger.info("Shutting down...")
 			observer.stop()
 			observer.join()
+			eventManager.fire(events.Events.SHUTDOWN)
 			octoprint.plugin.call_plugin(octoprint.plugin.ShutdownPlugin,
 			                             "on_shutdown")
+
+			# wait for shutdown even to be processed, but maximally for 15s
+			event_timeout = 15.0
+			if eventManager.join(timeout=event_timeout):
+				self._logger.warn("Event loop was still busy processing after {}s, shutting down anyhow".format(event_timeout))
 
 			if self._octoprint_daemon is not None:
 				self._logger.info("Cleaning up daemon pidfile")
@@ -543,6 +531,9 @@ class Server(object):
 		if "l10n" in request.values:
 			return Locale.negotiate([request.values["l10n"]], LANGUAGES)
 
+		if "X-Locale" in request.headers:
+			return Locale.negotiate([request.headers["X-Locale"]], LANGUAGES)
+
 		if hasattr(g, "identity") and g.identity and userManager.enabled:
 			userid = g.identity.id
 			try:
@@ -557,83 +548,6 @@ class Server(object):
 			return Locale.negotiate([default_language], LANGUAGES)
 
 		return Locale.parse(request.accept_languages.best_match(LANGUAGES))
-
-	def _setup_logging(self, debug, logConf=None):
-		defaultConfig = {
-			"version": 1,
-			"formatters": {
-				"simple": {
-					"format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-				}
-			},
-			"handlers": {
-				"console": {
-					"class": "logging.StreamHandler",
-					"level": "DEBUG",
-					"formatter": "simple",
-					"stream": "ext://sys.stdout"
-				},
-				"file": {
-					"class": "logging.handlers.TimedRotatingFileHandler",
-					"level": "DEBUG",
-					"formatter": "simple",
-					"when": "D",
-					"backupCount": "1",
-					"filename": os.path.join(settings().getBaseFolder("logs"), "octoprint.log")
-				},
-				"serialFile": {
-					"class": "logging.handlers.RotatingFileHandler",
-					"level": "DEBUG",
-					"formatter": "simple",
-					"maxBytes": 2 * 1024 * 1024, # let's limit the serial log to 2MB in size
-					"filename": os.path.join(settings().getBaseFolder("logs"), "serial.log")
-				}
-			},
-			"loggers": {
-				"SERIAL": {
-					"level": "CRITICAL",
-					"handlers": ["serialFile"],
-					"propagate": False
-				},
-				"tornado.application": {
-					"level": "INFO"
-				},
-				"tornado.general": {
-					"level": "INFO"
-				},
-				"octoprint.server.util.flask": {
-					"level": "WARN"
-				}
-			},
-			"root": {
-				"level": "INFO",
-				"handlers": ["console", "file"]
-			}
-		}
-
-		if debug:
-			defaultConfig["root"]["level"] = "DEBUG"
-
-		if logConf is None:
-			logConf = os.path.join(settings().getBaseFolder("base"), "logging.yaml")
-
-		configFromFile = {}
-		if os.path.exists(logConf) and os.path.isfile(logConf):
-			import yaml
-			with open(logConf, "r") as f:
-				configFromFile = yaml.safe_load(f)
-
-		config = octoprint.util.dict_merge(defaultConfig, configFromFile)
-		logging.config.dictConfig(config)
-		logging.captureWarnings(True)
-
-		import warnings
-		warnings.simplefilter("always")
-
-		if settings().getBoolean(["serial", "log"]):
-			# enable debug logging to serial.log
-			logging.getLogger("SERIAL").setLevel(logging.DEBUG)
-			logging.getLogger("SERIAL").debug("Enabling serial logging")
 
 	def _setup_app(self, app):
 		from octoprint.server.util.flask import ReverseProxiedEnvironment, OctoPrintFlaskRequest, OctoPrintFlaskResponse
@@ -772,10 +686,10 @@ class Server(object):
 
 		loaders = [app.jinja_loader, filesystem_loader]
 		if octoprint.util.is_running_from_source():
-			from octoprint.util.jinja import SelectedFileSystemLoader
 			root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 			allowed = ["AUTHORS.md", "CHANGELOG.md", "SUPPORTERS.md", "THIRDPARTYLICENSES.md"]
-			loaders.append(SelectedFileSystemLoader(root, allowed, prefix="_data/"))
+			files = {"_data/" + name: os.path.join(root, name) for name in allowed}
+			loaders.append(octoprint.util.jinja.SelectedFilesLoader(files))
 
 		jinja_loader = jinja2.ChoiceLoader(loaders)
 		app.jinja_loader = jinja_loader
@@ -818,17 +732,36 @@ class Server(object):
 				entries = reversed(sorted(cache_data[route], key=lambda x: x.get("_count", 0)))
 				for kwargs in entries:
 					plugin = kwargs.get("plugin", None)
+					if plugin:
+						try:
+							plugin_info = pluginManager.get_plugin_info(plugin, require_enabled=True)
+							if plugin_info is None:
+								self._logger.info("About to preemptively cache plugin {} but it is not installed or enabled, preemptive caching makes no sense".format(plugin))
+								continue
+
+							implementation = plugin_info.implementation
+							if implementation is None or not isinstance(implementation, octoprint.plugin.UiPlugin):
+								self._logger.info("About to preemptively cache plugin {} but it is not a UiPlugin, preemptive caching makes no sense".format(plugin))
+								continue
+							if not implementation.get_ui_preemptive_caching_enabled():
+								self._logger.info("About to preemptively cache plugin {} but it has disabled preemptive caching".format(plugin))
+								continue
+						except:
+							self._logger.exception("Error while trying to check if plugin {} has preemptive caching enabled, skipping entry")
+							continue
+
 					additional_request_data = kwargs.get("_additional_request_data", dict())
 					kwargs = dict((k, v) for k, v in kwargs.items() if not k.startswith("_") and not k == "plugin")
 					kwargs.update(additional_request_data)
 
 					try:
 						if plugin:
-							self._logger.info("Preemptively caching {} (plugin {}) for {!r}".format(route, plugin, kwargs))
+							self._logger.info("Preemptively caching {} (ui {}) for {!r}".format(route, plugin, kwargs))
 						else:
-							self._logger.info("Preemptively caching {} for {!r}".format(route, kwargs))
+							self._logger.info("Preemptively caching {} (ui _default) for {!r}".format(route, kwargs))
 
 						headers = kwargs.get("headers", dict())
+						headers["X-Force-View"] = plugin if plugin else "_default"
 						headers["X-Preemptive-Record"] = "no"
 						kwargs["headers"] = headers
 
@@ -1013,17 +946,18 @@ class Server(object):
 		enable_gcodeviewer = settings().getBoolean(["gcodeViewer", "enabled"])
 		preferred_stylesheet = settings().get(["devel", "stylesheet"])
 
-		dynamic_assets = util.flask.collect_plugin_assets(
+		dynamic_core_assets = util.flask.collect_core_assets(enable_gcodeviewer=enable_gcodeviewer)
+		dynamic_plugin_assets = util.flask.collect_plugin_assets(
 			enable_gcodeviewer=enable_gcodeviewer,
 			preferred_stylesheet=preferred_stylesheet
 		)
 
 		js_libs = [
-			"js/lib/jquery/jquery.min.js",
+			"js/lib/jquery/jquery.min.js" if minify else "js/lib/jquery/jquery.js",
 			"js/lib/modernizr.custom.js",
 			"js/lib/lodash.min.js",
 			"js/lib/sprintf.min.js",
-			"js/lib/knockout-3.4.0.js",
+			"js/lib/knockout.js",
 			"js/lib/knockout.mapping-latest.js",
 			"js/lib/babel.js",
 			"js/lib/avltree.js",
@@ -1047,13 +981,35 @@ class Server(object):
 			"js/lib/pnotify.min.js",
 			"js/lib/bootstrap-slider-knockout-binding.js",
 			"js/lib/loglevel.min.js",
-			"js/lib/sockjs-0.3.4.min.js"
+			"js/lib/sockjs.min.js" if minify else "js/lib/sockjs.js"
 		]
-		js_app = dynamic_assets["js"] + [
-			"js/app/dataupdater.js",
-			"js/app/helpers.js",
-			"js/app/main.js",
+		js_client = [
+			"js/app/client/base.js",
+			"js/app/client/socket.js",
+			"js/app/client/browser.js",
+			"js/app/client/connection.js",
+			"js/app/client/control.js",
+			"js/app/client/files.js",
+			"js/app/client/job.js",
+			"js/app/client/languages.js",
+			"js/app/client/logs.js",
+			"js/app/client/printer.js",
+			"js/app/client/printerprofiles.js",
+			"js/app/client/settings.js",
+			"js/app/client/slicing.js",
+			"js/app/client/system.js",
+			"js/app/client/timelapse.js",
+			"js/app/client/users.js",
+			"js/app/client/util.js",
+			"js/app/client/wizard.js"
 		]
+		js_core = dynamic_core_assets["js"] + \
+		    dynamic_plugin_assets["bundled"]["js"] + \
+		    ["js/app/dataupdater.js",
+		     "js/app/helpers.js",
+		     "js/app/main.js"]
+		js_plugins = dynamic_plugin_assets["external"]["js"]
+		js_app = js_plugins + js_core
 
 		css_libs = [
 			"css/bootstrap.min.css",
@@ -1064,13 +1020,13 @@ class Server(object):
 			"css/jquery.fileupload-ui.css",
 			"css/pnotify.min.css"
 		]
-		css_app = list(dynamic_assets["css"])
-		if len(css_app) == 0:
-			css_app = ["empty"]
+		css_core = list(dynamic_core_assets["css"]) + list(dynamic_plugin_assets["bundled"]["css"])
+		css_plugins = list(dynamic_plugin_assets["external"]["css"])
+		css_app = css_core + css_plugins
 
-		less_app = list(dynamic_assets["less"])
-		if len(less_app) == 0:
-			less_app = ["empty"]
+		less_core = list(dynamic_core_assets["less"]) + list(dynamic_plugin_assets["bundled"]["less"])
+		less_plugins = list(dynamic_plugin_assets["external"]["less"])
+		less_app = less_core + less_plugins
 
 		from webassets.filter import register_filter, Filter
 		from webassets.filter.cssrewrite.base import PatternRewriter
@@ -1091,7 +1047,7 @@ class Server(object):
 
 				return "{import_with_options}\"{import_url}\";".format(**locals())
 
-		class JsDelimiterBundle(Filter):
+		class JsDelimiterBundler(Filter):
 			name = "js_delimiter_bundler"
 			options = {}
 			def input(self, _in, out, **kwargs):
@@ -1099,24 +1055,75 @@ class Server(object):
 				out.write("\n;\n")
 
 		register_filter(LessImportRewrite)
-		register_filter(JsDelimiterBundle)
+		register_filter(JsDelimiterBundler)
 
+		# JS
 		js_libs_bundle = Bundle(*js_libs, output="webassets/packed_libs.js", filters="js_delimiter_bundler")
-		if settings().getBoolean(["devel", "webassets", "minify"]):
+		if minify:
+			js_client_bundle = Bundle(*js_client, output="webassets/packed_client.js", filters="rjsmin, js_delimiter_bundler")
+			js_core_bundle = Bundle(*js_core, output="webassets/packed_core.js", filters="rjsmin, js_delimiter_bundler")
+			if len(js_plugins) == 0:
+				js_plugins_bundle = Bundle(*[])
+			else:
+				js_plugins_bundle = Bundle(*js_plugins, output="webassets/packed_plugins.js", filters="rjsmin, js_delimiter_bundler")
 			js_app_bundle = Bundle(*js_app, output="webassets/packed_app.js", filters="rjsmin, js_delimiter_bundler")
 		else:
+			js_client_bundle = Bundle(*js_client, output="webassets/packed_client.js", filters="js_delimiter_bundler")
+			js_core_bundle = Bundle(*js_core, output="webassets/packed_core.js", filters="js_delimiter_bundler")
+			if len(js_plugins) == 0:
+				js_plugins_bundle = Bundle(*[])
+			else:
+				js_plugins_bundle = Bundle(*js_plugins, output="webassets/packed_plugins.js", filters="js_delimiter_bundler")
 			js_app_bundle = Bundle(*js_app, output="webassets/packed_app.js", filters="js_delimiter_bundler")
 
+		# CSS
 		css_libs_bundle = Bundle(*css_libs, output="webassets/packed_libs.css")
 		css_app_bundle = Bundle(*css_app, output="webassets/packed_app.css", filters="cssrewrite")
 
-		all_less_bundle = Bundle(*less_app, output="webassets/packed_app.less", filters="cssrewrite, less_importrewrite")
+		if len(css_core) == 0:
+			css_core_bundle = Bundle(*[])
+		else:
+			css_core_bundle = Bundle(*css_app, output="webassets/packed_core.css", filters="cssrewrite")
 
+		if len(css_plugins) == 0:
+			css_plugins_bundle = Bundle(*[])
+		else:
+			css_plugins_bundle = Bundle(*css_app, output="webassets/packed_plugins.css", filters="cssrewrite")
+
+		if len(css_app) == 0:
+			css_app_bundle = Bundle(*[])
+		else:
+			css_app_bundle = Bundle(*css_app, output="webassets/packed_app.css", filters="cssrewrite")
+
+		# LESS
+		if len(less_core) == 0:
+			less_core_bundle = Bundle(*[])
+		else:
+			less_core_bundle = Bundle(*less_app, output="webassets/packed_core.less", filters="cssrewrite, less_importrewrite")
+
+		if len(less_plugins) == 0:
+			less_plugins_bundle = Bundle(*[])
+		else:
+			less_plugins_bundle = Bundle(*less_app, output="webassets/packed_plugins.less", filters="cssrewrite, less_importrewrite")
+
+		if len(less_app) == 0:
+			less_app_bundle = Bundle(*[])
+		else:
+			less_app_bundle = Bundle(*less_app, output="webassets/packed_app.less", filters="cssrewrite, less_importrewrite")
+
+		# asset registration
 		assets.register("js_libs", js_libs_bundle)
+		assets.register("js_client", js_client_bundle)
+		assets.register("js_core", js_core_bundle)
+		assets.register("js_plugins", js_plugins_bundle)
 		assets.register("js_app", js_app_bundle)
 		assets.register("css_libs", css_libs_bundle)
+		assets.register("css_core", css_core_bundle)
+		assets.register("css_plugins", css_plugins_bundle)
 		assets.register("css_app", css_app_bundle)
-		assets.register("less_app", all_less_bundle)
+		assets.register("less_core", less_core_bundle)
+		assets.register("less_plugins", less_plugins_bundle)
+		assets.register("less_app", less_app_bundle)
 
 	def _start_intermediary_server(self, s):
 		import BaseHTTPServer

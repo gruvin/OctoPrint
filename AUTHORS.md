@@ -62,6 +62,10 @@ date of first contribution):
   * [Andrew Malota](https://github.com/2bitoperations)
   * [Kyle Evans](https://github.com/kevans91)
   * [Ovidiu Hossu](https://github.com/MoonshineSG)
+  * [Eyck Jentzsch](https://github.com/eyck)
+  * [Mathias Rangel Wulff](https://github.com/mathiasrw)
+  * [Clemens Niemeyer](https://github.com/clemniem)
+  * ["I-am-me"](https://github.com/I-am-me)
 
 OctoPrint started off as a fork of [Cura](https://github.com/daid/Cura) by
 [Daid Braam](https://github.com/daid). Parts of its communication layer and

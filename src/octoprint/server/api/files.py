@@ -10,7 +10,7 @@ from flask import request, jsonify, make_response, url_for
 from octoprint.filemanager.destinations import FileDestinations
 from octoprint.settings import settings, valid_boolean_trues
 from octoprint.server import printer, fileManager, slicingManager, eventManager, NO_CONTENT
-from octoprint.server.util.flask import restricted_access, get_json_command_from_request
+from octoprint.server.util.flask import restricted_access, get_json_command_from_request, with_revalidation_checking
 from octoprint.server.api import api
 from octoprint.events import Events
 import octoprint.filemanager
@@ -18,28 +18,111 @@ import octoprint.filemanager.util
 import octoprint.slicing
 
 import psutil
+import hashlib
+import logging
+import threading
 
 
 #~~ GCODE file handling
 
+_file_cache = dict()
+_file_cache_mutex = threading.RLock()
+
+def _clear_file_cache():
+	with _file_cache_mutex:
+		_file_cache.clear()
+
+def _create_lastmodified(path, recursive):
+	if path.endswith("/files"):
+		# all storages involved
+		lms = [0]
+		for storage in fileManager.registered_storages:
+			try:
+				lms.append(fileManager.last_modified(storage, recursive=recursive))
+			except:
+				logging.getLogger(__name__).exception("There was an error retrieving the last modified data from storage {}".format(storage))
+				lms.append(None)
+
+		if filter(lambda x: x is None, lms):
+			# we return None if ANY of the involved storages returned None
+			return None
+
+		# if we reach this point, we return the maximum of all dates
+		return max(lms)
+
+	elif path.endswith("/files/local"):
+		# only local storage involved
+		try:
+			return fileManager.last_modified(FileDestinations.LOCAL, recursive=recursive)
+		except:
+			logging.getLogger(__name__).exception("There was an error retrieving the last modified data from storage {}".format(FileDestinations.LOCAL))
+			return None
+
+	else:
+		return None
+
+
+def _create_etag(path, recursive, lm=None):
+	if lm is None:
+		lm = _create_lastmodified(path, recursive)
+
+	if lm is None:
+		return None
+
+	hash = hashlib.sha1()
+	hash.update(str(lm))
+	hash.update(str(recursive))
+
+	if path.endswith("/files") or path.endswith("/files/sdcard"):
+		# include sd data in etag
+		hash.update(repr(sorted(printer.get_sd_files(), key=lambda x: x[0])))
+
+	return hash.hexdigest()
+
 
 @api.route("/files", methods=["GET"])
+@with_revalidation_checking(etag_factory=lambda lm=None: _create_etag(request.path,
+                                                                      request.values.get("recursive", False),
+                                                                      lm=lm),
+                            lastmodified_factory=lambda: _create_lastmodified(request.path,
+                                                                              request.values.get("recursive", False)),
+                            unless=lambda: request.values.get("force", False) or request.values.get("_refresh", False))
 def readGcodeFiles():
-	filter = None
-	if "filter" in request.values:
-		filter = request.values["filter"]
-	files = _getFileList(FileDestinations.LOCAL, filter=filter)
+	filter = request.values.get("filter", "false") in valid_boolean_trues
+	recursive = request.values.get("recursive", "false") in valid_boolean_trues
+	force = request.values.get("force", "false") in valid_boolean_trues
+
+	if force:
+		_clear_file_cache()
+
+	files = _getFileList(FileDestinations.LOCAL, filter=filter, recursive=recursive)
 	files.extend(_getFileList(FileDestinations.SDCARD))
 	usage = psutil.disk_usage(settings().getBaseFolder("uploads"))
 	return jsonify(files=files, free=usage.free, total=usage.total)
 
 
 @api.route("/files/<string:origin>", methods=["GET"])
+@with_revalidation_checking(etag_factory=lambda lm=None: _create_etag(request.path,
+                                                                      request.values.get("recursive", False),
+                                                                      lm=lm),
+                            lastmodified_factory=lambda: _create_lastmodified(request.path,
+                                                                              request.values.get("recursive", False)),
+                            unless=lambda: request.values.get("force", False) or request.values.get("_refresh", False))
 def readGcodeFilesForOrigin(origin):
 	if origin not in [FileDestinations.LOCAL, FileDestinations.SDCARD]:
 		return make_response("Unknown origin: %s" % origin, 404)
 
-	files = _getFileList(origin)
+	recursive = request.values.get("recursive", "false") in valid_boolean_trues
+	force = request.values.get("force", "false") in valid_boolean_trues
+
+	if force:
+		with _file_cache_mutex:
+			try:
+				del _file_cache[origin]
+			except KeyError:
+				pass
+
+	files = _getFileList(origin, recursive=recursive)
 
 	if origin == FileDestinations.LOCAL:
 		usage = psutil.disk_usage(settings().getBaseFolder("uploads"))
@@ -78,45 +161,69 @@ def _getFileList(origin, filter=None):
 		filter_func = None
 		if filter:
 			filter_func = lambda entry, entry_data: octoprint.filemanager.valid_file_type(entry, type=filter)
-		files = fileManager.list_files(origin, filter=filter_func, recursive=False)[origin].values()
-		for file in files:
-			file["origin"] = FileDestinations.LOCAL
 
-			if "analysis" in file and octoprint.filemanager.valid_file_type(file["name"], type="gcode"):
-				file["gcodeAnalysis"] = file["analysis"]
-				del file["analysis"]
+		with _file_cache_mutex:
+			files, lastmodified = _file_cache.get("{}:{}:{}:{}".format(origin, path, recursive, filter), ([], None))
+			if lastmodified is None or lastmodified < fileManager.last_modified(origin, path=path, recursive=recursive):
+				files = fileManager.list_files(origin, path=path, filter=filter_func, recursive=recursive)[origin].values()
+				lastmodified = fileManager.last_modified(origin, path=path, recursive=recursive)
+				_file_cache["{}:{}:{}:{}".format(origin, path, recursive, filter)] = (files, lastmodified)
 
-			if "history" in file and octoprint.filemanager.valid_file_type(file["name"], type="gcode"):
-				# convert print log
-				history = file["history"]
-				del file["history"]
-				success = 0
-				failure = 0
-				last = None
-				for entry in history:
-					success += 1 if "success" in entry and entry["success"] else 0
-					failure += 1 if "success" in entry and not entry["success"] else 0
-					if not last or ("timestamp" in entry and "timestamp" in last and entry["timestamp"] > last["timestamp"]):
-						last = entry
-				if last:
-					prints = dict(
-						success=success,
-						failure=failure,
-						last=dict(
-							success=last["success"],
-							date=last["timestamp"]
-						)
-					)
-					if "printTime" in last:
-						prints["last"]["printTime"] = last["printTime"]
-					file["prints"] = prints
+		def analyse_recursively(files, path=None):
+			if path is None:
+				path = ""
 
-			file.update({
-				"refs": {
-					"resource": url_for(".readGcodeFile", target=FileDestinations.LOCAL, filename=file["name"], _external=True),
-					"download": url_for("index", _external=True) + "downloads/files/" + FileDestinations.LOCAL + "/" + file["name"]
-				}
-			})
+			result = []
+			for file_or_folder in files:
+				# make a shallow copy in order to not accidentally modify the cached data
+				file_or_folder = dict(file_or_folder)
+
+				file_or_folder["origin"] = FileDestinations.LOCAL
+
+				if file_or_folder["type"] == "folder":
+					if "children" in file_or_folder:
+						file_or_folder["children"] = analyse_recursively(file_or_folder["children"].values(), path + file_or_folder["name"] + "/")
+
+					file_or_folder["refs"] = dict(resource=url_for(".readGcodeFile", target=FileDestinations.LOCAL, filename=path + file_or_folder["name"], _external=True))
+				else:
+					if "analysis" in file_or_folder and octoprint.filemanager.valid_file_type(file_or_folder["name"], type="gcode"):
+						file_or_folder["gcodeAnalysis"] = file_or_folder["analysis"]
+						del file_or_folder["analysis"]
+
+					if "history" in file_or_folder and octoprint.filemanager.valid_file_type(file_or_folder["name"], type="gcode"):
+						# convert print log
+						history = file_or_folder["history"]
+						del file_or_folder["history"]
+						success = 0
+						failure = 0
+						last = None
+						for entry in history:
+							success += 1 if "success" in entry and entry["success"] else 0
+							failure += 1 if "success" in entry and not entry["success"] else 0
+							if not last or ("timestamp" in entry and "timestamp" in last and entry["timestamp"] > last["timestamp"]):
+								last = entry
+						if last:
+							prints = dict(
+								success=success,
+								failure=failure,
+								last=dict(
+									success=last["success"],
+									date=last["timestamp"]
+								)
+							)
+							if "printTime" in last:
+								prints["last"]["printTime"] = last["printTime"]
+							file_or_folder["prints"] = prints
+
+					file_or_folder["refs"] = dict(resource=url_for(".readGcodeFile", target=FileDestinations.LOCAL, filename=file_or_folder["path"], _external=True),
+					                              download=url_for("index", _external=True) + "downloads/files/" + FileDestinations.LOCAL + "/" + file_or_folder["path"])
+
+				result.append(file_or_folder)
+
+			return result
+
+		files = analyse_recursively(files)
+
 	return files
 
 
@@ -416,6 +523,65 @@ def gcodeFileCommand(filename, target):
 		}
 
 		r = make_response(jsonify(result), 202)
+		r.headers["Location"] = location
+		return r
+
+	elif command == "copy" or command == "move":
+		# Copy and move are only possible on local storage
+		if not target in [FileDestinations.LOCAL]:
+			return make_response("Unsupported target for {}: {}".format(command, target), 400)
+
+		if not _verifyFileExists(target, filename) and not _verifyFolderExists(target, filename):
+			return make_response("File or folder not found on {}: {}".format(target, filename), 404)
+
+		path, name = fileManager.split_path(target, filename)
+		destination = data["destination"]
+		if _verifyFolderExists(target, destination):
+			# destination is an existing folder, we'll assume we are supposed to move filename to this
+			# folder under the same name
+			destination = fileManager.join_path(target, destination, name)
+
+		if _verifyFileExists(target, destination) or _verifyFolderExists(target, destination):
+			return make_response("File or folder does already exist on {}: {}".format(target, destination), 409)
+
+		is_file = fileManager.file_exists(target, filename)
+		is_folder = fileManager.folder_exists(target, filename)
+
+		if not (is_file or is_folder):
+			return make_response("{} on {} is neither file or folder, can't {}".format(filename, target, command), 400)
+
+		if command == "copy":
+			if is_file:
+				fileManager.copy_file(target, filename, destination)
+			else:
+				fileManager.copy_folder(target, filename, destination)
+		elif command == "move":
+			if _isBusy(target, filename):
+				return make_response("Trying to move a file or folder that is currently in use: {}".format(filename), 409)
+
+			# deselect the file if it's currently selected
+			currentOrigin, currentFilename = _getCurrentFile()
+			if currentFilename is not None and filename == currentFilename:
+				printer.unselect_file()
+
+			if is_file:
+				fileManager.move_file(target, filename, destination)
+			else:
+				fileManager.move_folder(target, filename, destination)
+
+		location = url_for(".readGcodeFile", target=target, filename=destination, _external=True)
+		result = {
+			"name": name,
+			"path": destination,
+			"origin": FileDestinations.LOCAL,
+			"refs": {
+				"resource": location
+			}
+		}
+		if is_file:
+			result["refs"]["download"] = url_for("index", _external=True) + "downloads/files/" + target + "/" + destination
+
+		r = make_response(jsonify(result), 201)
 		r.headers["Location"] = location
 		return r
 

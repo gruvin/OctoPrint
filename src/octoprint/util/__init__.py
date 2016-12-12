@@ -1,4 +1,6 @@
 # coding=utf-8
+from __future__ import absolute_import
+
 """
 This module bundles commonly used utility methods or helper classes that are used in multiple places withing
 OctoPrint's source code.
@@ -436,6 +438,16 @@ def to_unicode(s_or_u, encoding="utf-8", errors="strict"):
 		return s_or_u
 
 
+def chunks(l, n):
+	"""
+	Yield successive n-sized chunks from l.
+
+	Taken from http://stackoverflow.com/a/312464/2028598
+	"""
+	for i in range(0, len(l), n):
+		yield l[i:i+n]
+
+
 def is_running_from_source():
 	root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 	return os.path.isdir(os.path.join(root, "src")) and os.path.isfile(os.path.join(root, "setup.py"))
@@ -693,12 +705,17 @@ def address_for_client(host, port):
 
 
 @contextlib.contextmanager
-def atomic_write(filename, mode="w+b", prefix="tmp", suffix=""):
+def atomic_write(filename, mode="w+b", prefix="tmp", suffix="", permissions=0o644, max_permissions=0o777):
+	if os.path.exists(filename):
+		permissions |= os.stat(filename).st_mode
+	permissions &= max_permissions
+
 	temp_config = tempfile.NamedTemporaryFile(mode=mode, prefix=prefix, suffix=suffix, delete=False)
 	try:
 		yield temp_config
 	finally:
 		temp_config.close()
+	os.chmod(temp_config.name, permissions)
 	shutil.move(temp_config.name, filename)
 
 

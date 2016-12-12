@@ -55,6 +55,10 @@ $(function() {
         self.reader_sortLayers = ko.observable(true);
         self.reader_hideEmptyLayers = ko.observable(true);
 
+        self.layerSelectionEnabled = ko.observable(false);
+        self.layerUpEnabled = ko.observable(false);
+        self.layerDownEnabled = ko.observable(false);
+
         self.synchronizeOptions = function(additionalRendererOptions, additionalReaderOptions) {
             var renderer = {
                 moveModel: self.renderer_centerModel(),
@@ -221,6 +225,7 @@ $(function() {
 
         self.currentLayer = undefined;
         self.currentCommand = undefined;
+        self.maxLayer = undefined;
 
         self.initialize = function() {
             var layerSliderElement = $("#gcode_slider_layers");
@@ -430,8 +435,12 @@ $(function() {
                     self.layerSlider.slider("disable");
                     self.layerSlider.slider("setMax", 1);
                     self.layerSlider.slider("setValue", 0);
+                    self.layerSelectionEnabled(false);
+                    self.layerDownEnabled(false);
+                    self.layerUpEnabled(false);
                 }
                 self.currentLayer = 0;
+                self.maxLayer = 0;
             } else {
                 var output = [];
                 output.push(gettext("Model size") + ": " + model.width.toFixed(2) + "mm &times; " + model.depth.toFixed(2) + "mm &times; " + model.height.toFixed(2) + "mm");
@@ -441,10 +450,14 @@ $(function() {
 
                 self.ui_modelInfo(output.join("<br>"));
 
+                self.maxLayer = model.layersPrinted - 1;
                 if (self.layerSlider != undefined) {
                     self.layerSlider.slider("enable");
-                    self.layerSlider.slider("setMax", model.layersPrinted - 1);
+                    self.layerSlider.slider("setMax", self.maxLayer);
                     self.layerSlider.slider("setValue", 0);
+                    self.layerSelectionEnabled(true);
+                    self.layerDownEnabled(false);
+                    self.layerUpEnabled(self.maxLayer > 0);
                 }
             }
         };
@@ -456,6 +469,9 @@ $(function() {
                     self.layerCommandSlider.slider("disable");
                     self.layerCommandSlider.slider("setMax", 1);
                     self.layerCommandSlider.slider("setValue", [0, 1]);
+
+                    self.layerDownEnabled(false);
+                    self.layerUpEnabled(false);
                 }
                 self.currentCommand = [0, 1];
             } else {
@@ -476,10 +492,14 @@ $(function() {
 
                 self.ui_layerInfo(output.join("<br>"));
 
+                console.log("#### Layer number:", layer.number, ", max layer:", self.maxLayer);
                 if (self.layerCommandSlider != undefined) {
                     self.layerCommandSlider.slider("enable");
                     self.layerCommandSlider.slider("setMax", layer.commands - 1);
                     self.layerCommandSlider.slider("setValue", [0, layer.commands - 1]);
+
+                    self.layerDownEnabled(layer.number > 0);
+                    self.layerUpEnabled(layer.number < self.maxLayer);
                 }
             }
         };
@@ -508,6 +528,36 @@ $(function() {
             GCODE.ui.changeSelectedLayer(value);
         };
 
+        self.onMouseOver = function(data, event) {
+            if (!self.settings.feature_keyboardControl()) return;
+            $("#canvas_container").focus();
+
+        };
+        self.onMouseOut = function(data, event) {
+            if (!self.settings.feature_keyboardControl()) return;
+            $("#canvas_container").blur();
+        };
+        self.onKeyDown = function(data, event) {
+            if (!self.settings.feature_keyboardControl() || self.layerSlider === undefined) return;
+
+            var value = self.currentLayer;
+            switch(event.which){
+                case 33: // Pg up
+                    value = value + 10; // No need to check against max this is done by the Slider anyway
+                    break;
+                case 34: // Pg down
+                    value = value - 10; // No need to check against min, this is done by the Slider anyway
+                    break;
+                case 38: // up arrow key
+                    value = value + 1; // No need to check against max this is done by the Slider anyway
+                    break;
+                case 40: // down arrow key
+                    value = value - 1; // No need to check against min, this is done by the Slider anyway
+                    break;
+            }
+            self.shiftLayer(value);
+        };
+
         self.changeCommandRange = function(event) {
             if (self.currentlyPrinting && self.renderer_syncProgress()) self.renderer_syncProgress(false);
 
@@ -528,6 +578,36 @@ $(function() {
 
         self.onTabChange = function(current, previous) {
             self.tabActive = current == "#gcode";
+        };
+
+        self.shiftLayer = function(value){
+            if (value != self.currentLayer) {
+                self.layerSlider.slider('setValue', value);
+                value = self.layerSlider.slider('getValue');
+                //This sets the scroll bar to the appropriate position.
+                self.layerSlider
+                    .trigger({
+                        type: 'slideStart',
+                        value: value
+                    })
+                    .trigger({
+                        type: 'slide',
+                        value: value
+                    }).trigger({
+                        type: 'slideStop',
+                        value: value
+                    });
+            }
+        };
+
+        self.incrementLayer = function() {
+            var value = self.layerSlider.slider('getValue') + 1;
+            self.shiftLayer(value);
+        };
+
+        self.decrementLayer = function() {
+            var value = self.layerSlider.slider('getValue') - 1;
+            self.shiftLayer(value);
         };
     }
 

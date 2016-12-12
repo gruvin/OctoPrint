@@ -26,6 +26,7 @@ def all_events():
 class Events(object):
 	# application startup
 	STARTUP = "Startup"
+	SHUTDOWN = "Shutdown"
 
 	# connect/disconnect to printer
 	CONNECTED = "Connected"
@@ -69,6 +70,7 @@ class Events(object):
 	CONVEYOR = "Conveyor"
 	EJECT = "Eject"
 	E_STOP = "EStop"
+	POSITION_UPDATE = "PositionUpdate"
 	REGISTERED_MESSAGE_RECEIVED = "RegisteredMessageReceived"
 
 	# Timelapse
@@ -115,15 +117,22 @@ class EventManager(object):
 		self._registeredListeners = collections.defaultdict(list)
 		self._logger = logging.getLogger(__name__)
 
-		self._queue = Queue.Queue()
+		self._shutdown_signaled = False
+
+		self._queue = queue.Queue()
+
 		self._worker = threading.Thread(target=self._work)
 		self._worker.daemon = True
 		self._worker.start()
 
 	def _work(self):
 		try:
-			while True:
+			while not self._shutdown_signaled:
 				event, payload = self._queue.get(True)
+				if event == Events.SHUTDOWN:
+					# we've got the shutdown event here, stop event loop processing after this has been processed
+					self._logger.info("Processing shutdown event, this will be our last event")
+					self._shutdown_signaled = True
 
 				eventListeners = self._registeredListeners[event]
 				self._logger.debug("Firing event: %s (Payload: %r)" % (event, payload))
@@ -137,7 +146,8 @@ class EventManager(object):
 
 				octoprint.plugin.call_plugin(octoprint.plugin.types.EventHandlerPlugin,
 				                             "on_event",
-				                             args=[event, payload])
+				                             args=(event, payload))
+			self._logger.info("Event loop shut down")
 		except:
 			self._logger.exception("Ooops, the event bus worker loop crashed")
 
@@ -185,6 +195,10 @@ class EventManager(object):
 
 		self._registeredListeners[event].remove(callback)
 		self._logger.debug("Unsubscribed listener %r for event %s" % (callback, event))
+
+	def join(self, timeout=None):
+		self._worker.join(timeout)
+		return self._worker.is_alive()
 
 
 class GenericEventListener(object):
@@ -360,7 +374,8 @@ class CommandTrigger(GenericEventListener):
 		if "currentZ" in currentData.keys() and currentData["currentZ"] is not None:
 			params["__currentZ"] = str(currentData["currentZ"])
 
-		if "job" in currentData.keys() and currentData["job"] is not None:
+		if "job" in currentData and "file" in currentData["job"] and "name" in currentData["job"]["file"] \
+				and currentData["job"]["file"]["name"] is not None:
 			params["__filename"] = currentData["job"]["file"]["name"]
 			if "progress" in currentData.keys() and currentData["progress"] is not None \
 				and "completion" in currentData["progress"].keys() and currentData["progress"]["completion"] is not None:

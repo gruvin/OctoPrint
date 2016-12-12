@@ -29,6 +29,10 @@ import yaml
 import logging
 import re
 import uuid
+import copy
+import time
+
+from builtins import bytes
 
 from octoprint.util import atomic_write, is_hidden_path
 
@@ -91,7 +95,8 @@ default_settings = {
 		},
 		"maxWritePasses": 5,
 		"additionalPorts": [],
-		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32", "M400", "M226"],
+		"additionalBaudrates": [],
+		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32", "M400", "M226", "M600"],
 		"checksumRequiringCommands": ["M110"],
 		"helloCommand": "M110 N0",
 		"disconnectOnErrors": True,
@@ -106,6 +111,8 @@ default_settings = {
 		"host": "0.0.0.0",
 		"port": 5000,
 		"firstRun": True,
+		"startOnceInSafeMode": False,
+		"seenWizards": {},
 		"secretKey": None,
 		"reverseProxy": {
 			"prefixHeader": None,
@@ -153,7 +160,8 @@ default_settings = {
 			"type": "off",
 			"options": {},
 			"postRoll": 0,
-			"fps": 25
+			"fps": 25,
+			"capturePostRoll": True
 		},
 		"cleanTmpAfterDays": 7
 	},
@@ -181,7 +189,10 @@ default_settings = {
 		"keyboardControl": True,
 		"pollWatched": False,
 		"ignoreIdenticalResends": False,
-		"identicalResendsCountdown": 7
+		"identicalResendsCountdown": 7,
+		"supportFAsCommand": False,
+		"modelSizeDetection": True,
+		"firmwareDetection": True
 	},
 	"folder": {
 		"uploads": None,
@@ -314,12 +325,6 @@ default_settings = {
 			"numExtruders": 1,
 			"includeCurrentToolInTemps": True,
 			"includeFilenameInOpened": True,
-			"movementSpeed": {
-				"x": 6000,
-				"y": 6000,
-				"z": 200,
-				"e": 300
-			},
 			"hasBed": True,
 			"repetierStyleTargetTemperature": False,
 			"repetierStyleResends": False,
@@ -335,7 +340,9 @@ default_settings = {
 			"waitInterval": 1.0,
 			"supportM112": True,
 			"echoOnM117": True,
-			"brokenM29": True
+			"brokenM29": True,
+			"supportF": False,
+			"firmwareName": "Virtual Marlin 1.0"
 		}
 	}
 }
@@ -408,6 +415,7 @@ class Settings(object):
 
 		self._config = None
 		self._dirty = False
+		self._dirty_time = 0
 		self._mtime = None
 
 		self._get_preprocessors = dict(
@@ -602,6 +610,57 @@ class Settings(object):
 		import yaml
 		return yaml.safe_dump(self.effective)
 
+	@property
+	def effective_hash(self):
+		import hashlib
+		hash = hashlib.md5()
+		hash.update(self.effective_yaml)
+		return hash.hexdigest()
+
+	@property
+	def config_yaml(self):
+		import yaml
+		return yaml.safe_dump(self._config)
+
+	@property
+	def config_hash(self):
+		import hashlib
+		hash = hashlib.md5()
+		hash.update(self.config_yaml)
+		return hash.hexdigest()
+
+	@property
+	def _config(self):
+		return self._map.maps[0]
+
+	@_config.setter
+	def _config(self, value):
+		self._map.maps[0] = value
+
+	@property
+	def _overlay_maps(self):
+		if len(self._map.maps) > 2:
+			return self._map.maps[1:-1]
+		else:
+			return []
+
+	@property
+	def _default_map(self):
+		return self._map.maps[-1]
+
+	@property
+	def last_modified(self):
+		"""
+		Returns:
+		    int: The last modification time of the configuration file.
+		"""
+		stat = os.stat(self._configfile)
+		return stat.st_mtime
+
+	@property
+	def last_modified_or_made_dirty(self):
+		return max(self.last_modified, self._dirty_time)
+
 	#~~ load and save
 
 	def load(self, migrate=False):
@@ -616,19 +675,58 @@ class Settings(object):
 		if migrate:
 			self._migrate_config()
 
-	def _migrate_config(self):
+	def load_overlay(self, overlay, migrate=True):
+		config = None
+
+		if callable(overlay):
+			try:
+				overlay = overlay(self)
+			except:
+				self._logger.exception("Error loading overlay from callable")
+				return
+
+		if isinstance(overlay, basestring):
+			if os.path.exists(overlay) and os.path.isfile(overlay):
+				with open(overlay, "r") as f:
+					config = yaml.safe_load(f)
+		elif isinstance(overlay, dict):
+			config = overlay
+		else:
+			raise ValueError("Overlay must be either a path to a yaml file or a dictionary")
+
+		if not isinstance(config, dict):
+			raise ValueError("Configuration data must be a dict but is a {}".format(config.__class__))
+
+		if migrate:
+			self._migrate_config(config)
+		return config
+
+	def add_overlay(self, overlay, at_end=False):
+		if at_end:
+			pos = len(self._map.maps) - 1
+			self._map.maps.insert(pos, overlay)
+		else:
+			self._map.maps.insert(1, overlay)
+
+	def _migrate_config(self, config=None, persist=False):
+		if config is None:
+			config = self._config
+			persist = True
+
 		dirty = False
 
 		migrators = (
 			self._migrate_event_config,
 			self._migrate_reverse_proxy_config,
 			self._migrate_printer_parameters,
-			self._migrate_gcode_scripts
+			self._migrate_gcode_scripts,
+			self._migrate_core_system_commands
 		)
 
 		for migrate in migrators:
-			dirty = migrate() or dirty
-		if dirty:
+			dirty = migrate(config) or dirty
+
+		if dirty and persist:
 			self.save(force=True)
 
 	def _migrate_gcode_scripts(self):
@@ -666,6 +764,7 @@ class Settings(object):
 			printer_parameters = self._config["printerParameters"]
 
 			if "movementSpeed" in printer_parameters or "invertAxes" in printer_parameters:
+				dirty = True
 				default_profile["axes"] = dict(x=dict(), y=dict(), z=dict(), e=dict())
 				if "movementSpeed" in printer_parameters:
 					for axis in ("x", "y", "z", "e"):
@@ -679,6 +778,7 @@ class Settings(object):
 					del self._config["printerParameters"]["invertedAxes"]
 
 			if "numExtruders" in printer_parameters or "extruderOffsets" in printer_parameters:
+				dirty = True
 				if not "extruder" in default_profile:
 					default_profile["extruder"] = dict()
 
@@ -694,6 +794,7 @@ class Settings(object):
 					del self._config["printerParameters"]["extruderOffsets"]
 
 			if "bedDimensions" in printer_parameters:
+				dirty = True
 				bed_dimensions = printer_parameters["bedDimensions"]
 				if not "volume" in default_profile:
 					default_profile["volume"] = dict()
@@ -709,8 +810,6 @@ class Settings(object):
 					if "y" in bed_dimensions:
 						default_profile["volume"]["depth"] = bed_dimensions["y"]
 				del self._config["printerParameters"]["bedDimensions"]
-
-			dirty = True
 
 		if dirty:
 			if not "printerProfiles" in self._config:
@@ -836,13 +935,74 @@ class Settings(object):
 		else:
 			return False
 
+	def _migrate_core_system_commands(self, config):
+		"""
+		Migrates system commands for restart, reboot and shutdown as defined on OctoPi or
+		according to the official setup guide to new core system commands to remove
+		duplication.
+
+		If server commands for action is not yet set, migrates command. Otherwise only
+		deletes definition from custom system commands.
+		"""
+		changed = False
+
+		migration_map = dict(shutdown="systemShutdownCommand",
+		                     reboot="systemRestartCommand",
+		                     restart="serverRestartCommand")
+
+		if "system" in config and "actions" in config["system"]:
+			actions = config["system"]["actions"]
+			to_delete = []
+			for index, spec in enumerate(actions):
+				action = spec.get("action")
+				command = spec.get("command")
+				if action is None or command is None:
+					continue
+
+				migrate_to = migration_map.get(action)
+				if migrate_to is not None:
+					if not "server" in config or not "commands" in config["server"] or not migrate_to in config["server"]["commands"]:
+						if not "server" in config:
+							config["server"] = dict()
+						if not "commands" in config["server"]:
+							config["server"]["commands"] = dict()
+						config["server"]["commands"][migrate_to] = command
+						self._logger.info("Migrated {} action to server.commands.{}".format(action, migrate_to))
+
+					to_delete.append(index)
+					self._logger.info("Deleting {} action from configured system commands, superseeded by server.commands.{}".format(action, migrate_to))
+
+			for index in reversed(to_delete):
+				actions.pop(index)
+				changed = True
+
+		if changed:
+			# let's make a backup of our current config, in case someone wants to roll back to an
+			# earlier version and needs to recover the former system commands for that
+			backup_path = self.backup("system_command_migration")
+			self._logger.info("Made a copy of the current config at {} to allow recovery of manual system command configuration".format(backup_path))
+
+		return changed
+
+	def backup(self, suffix, path=None):
+		import shutil
+
+		if path is None:
+			path = os.path.dirname(self._configfile)
+		basename = os.path.basename(self._configfile)
+		name, ext = os.path.splitext(basename)
+
+		backup = os.path.join(path, "{}.{}{}".format(name, suffix, ext))
+		shutil.copy(self._configfile, backup)
+		return backup
+
 	def save(self, force=False):
 		if not self._dirty and not force:
 			return False
 
 		from octoprint.util import atomic_write
 		try:
-			with atomic_write(self._configfile, "wb", prefix="octoprint-config-", suffix=".yaml") as configFile:
+			with atomic_write(self._configfile, "wb", prefix="octoprint-config-", suffix=".yaml", permissions=0o600, max_permissions=0o666) as configFile:
 				yaml.safe_dump(self._config, configFile, default_flow_style=False, indent="    ", allow_unicode=True)
 				self._dirty = False
 		except:
@@ -869,26 +1029,27 @@ class Settings(object):
 		if len(path) == 0:
 			raise NoSuchSettingsPath()
 
-		if config is None:
-			config = self._config
-		if defaults is None:
-			defaults = default_settings
+		if config is not None or defaults is not None:
+			if config is None:
+				config = self._config
+
+			if defaults is None:
+				defaults = dict(self._map.parents)
+
+			# mappings: provided config + any intermediary parents + provided defaults + regular defaults
+			mappings = [config] + self._overlay_maps + [defaults, self._default_map]
+			chain = HierarchicalChainMap(*mappings)
+		else:
+			chain = self._map
+
 		if preprocessors is None:
 			preprocessors = self._get_preprocessors
 
-		while len(path) > 1:
-			key = path.pop(0)
-			if key in config:
-				config = config[key]
-				defaults = defaults.get(key, dict())
-			elif incl_defaults and key in defaults:
-				config = {}
-				defaults = defaults[key]
-			else:
-				raise NoSuchSettingsPath()
-
-			if preprocessors and isinstance(preprocessors, dict) and key in preprocessors:
-				preprocessors = preprocessors[key]
+		preprocessor = None
+		try:
+			preprocessor = self._get_by_path(path, preprocessors)
+		except NoSuchSettingsPath:
+			pass
 
 
 		k = path.pop(0)
@@ -1041,10 +1202,14 @@ class Settings(object):
 				return
 			config = config[key]
 
-		key = path.pop(0)
-		if isinstance(config, dict) and key in config:
-			del config[key]
-		self._dirty = True
+		try:
+			chain.del_by_path(path)
+			self._dirty = True
+			self._dirty_time = time.time()
+		except KeyError:
+			if error_on_path:
+				raise NoSuchSettingsPath()
+			pass
 
 	#~~ setter
 
@@ -1074,23 +1239,37 @@ class Settings(object):
 			else:
 				return
 
-			if preprocessors and isinstance(preprocessors, dict) and key in preprocessors:
-				preprocessors = preprocessors[key]
+		if preprocessors is None:
+			preprocessors = self._set_preprocessors
 
-		key = path.pop(0)
+		preprocessor = None
+		try:
+			preprocessor = self._get_by_path(path, preprocessors)
+		except NoSuchSettingsPath:
+			pass
+
+		if callable(preprocessor):
+			value = preprocessor(value)
 
 		if preprocessors and isinstance(preprocessors, dict) and key in preprocessors and callable(preprocessors[key]):
 			value = preprocessors[key](value)
 
-		if not force and key in defaults and key in config and defaults[key] == value:
-			del config[key]
-			self._dirty = True
-		elif force or (not key in config and key in defaults and defaults[key] != value) or (key in config and config[key] != value):
-			if value is None and key in config:
-				del config[key]
+		if not force and in_defaults and in_local and default_value == value:
+			try:
+				chain.del_by_path(path)
+				self._dirty = True
+				self._dirty_time = time.time()
+			except KeyError:
+				if error_on_path:
+					raise NoSuchSettingsPath()
+				pass
+		elif force or (not in_local and in_defaults and default_value != value) or (in_local and current != value):
+			if value is None and in_local:
+				chain.del_by_path(path)
 			else:
 				config[key] = value
 			self._dirty = True
+			self._dirty_time = time.time()
 
 	def setInt(self, path, value, **kwargs):
 		if value is None:
@@ -1137,11 +1316,13 @@ class Settings(object):
 			if not self._config["folder"]:
 				del self._config["folder"]
 			self._dirty = True
+			self._dirty_time = time.time()
 		elif (path != currentPath and path != defaultPath) or force:
 			if not "folder" in self._config.keys():
 				self._config["folder"] = {}
 			self._config["folder"][type] = path
 			self._dirty = True
+			self._dirty_time = time.time()
 
 	def saveScript(self, script_type, name, script):
 		script_folder = self.getBaseFolder("scripts")
@@ -1153,7 +1334,7 @@ class Settings(object):
 		path, _ = os.path.split(filename)
 		if not os.path.exists(path):
 			os.makedirs(path)
-		with atomic_write(filename, "wb") as f:
+		with atomic_write(filename, "wb", max_permissions=0o666) as f:
 			f.write(script)
 
 def _default_basedir(applicationName):

@@ -120,6 +120,8 @@ $(function() {
         };
 
         self.onEventSettingsUpdated = function (payload) {
+            // the webcam url might have changed, make sure we replace it now if the tab is focused
+            self._enableWebcam();
             self.requestData();
         };
 
@@ -465,9 +467,9 @@ $(function() {
             }
             var webcamImage = $("#webcam_image");
             var currentSrc = webcamImage.attr("src");
-            if (currentSrc === undefined || currentSrc.trim() == "") {
-                var newSrc = CONFIG_WEBCAM_STREAM;
-                if (CONFIG_WEBCAM_STREAM.lastIndexOf("?") > -1) {
+            var newSrc = self.settings.webcam_streamUrl();
+            if (currentSrc != newSrc) {
+                if (newSrc.lastIndexOf("?") > -1) {
                     newSrc += "&";
                 } else {
                     newSrc += "?";

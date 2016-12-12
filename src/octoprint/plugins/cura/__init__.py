@@ -46,7 +46,8 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 
 	def on_startup(self, host, port):
 		# setup our custom logger
-		cura_logging_handler = logging.handlers.RotatingFileHandler(self._settings.get_plugin_logfile_path(postfix="engine"), maxBytes=2*1024*1024)
+		from octoprint.logging.handlers import CleaningTimedRotatingFileHandler
+		cura_logging_handler = CleaningTimedRotatingFileHandler(self._settings.get_plugin_logfile_path(postfix="engine"), when="D", backupCount=3)
 		cura_logging_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 		cura_logging_handler.setLevel(logging.DEBUG)
 
@@ -232,9 +233,15 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 				if not executable:
 					return False, "Path to CuraEngine is not configured "
 
-				working_dir, _ = os.path.split(executable)
+				working_dir = os.path.dirname(executable)
+
+				engine_settings = self._convert_to_engine(profile_path, printer_profile, posX, posY)
+
+				# Start building the argument list for the CuraEngine command execution
 				args = [executable, '-v', '-p']
-				for k, v in engine_settings.items():
+
+				# Add the settings (sorted alphabetically) to the command
+				for k, v in sorted(engine_settings.items(), key=lambda s: s[0]):
 					args += ["-s", "%s=%s" % (k, str(v))]
 				args += ["-o", machinecode_path, model_path]
 
@@ -333,11 +340,13 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 									analysis["filament"] = dict()
 								if not tool_key in analysis["filament"]:
 									analysis["filament"][tool_key] = dict()
-								analysis["filament"][tool_key]["length"] = filament
-								if "filamentDiameter" in engine_settings:
-									radius_in_cm = float(int(engine_settings["filamentDiameter"]) / 10000.0) / 2.0
-									filament_in_cm = filament / 10.0
-									analysis["filament"][tool_key]["volume"] = filament_in_cm * math.pi * radius_in_cm * radius_in_cm
+
+								if profile.get_float("filament_diameter") != None:
+									if profile.get("gcode_flavor") == GcodeFlavors.ULTIGCODE or profile.get("gcode_flavor") == GcodeFlavors.REPRAP_VOLUME:
+										analysis["filament"][tool_key] = _get_usage_from_volume(filament, profile.get_float("filament_diameter"))
+									else:
+										analysis["filament"][tool_key] = _get_usage_from_length(filament, profile.get_float("filament_diameter"))
+
 							except:
 								pass
 			finally:
@@ -391,7 +400,7 @@ class CuraPlugin(octoprint.plugin.SlicerPlugin,
 
 	def _save_profile(self, path, profile, allow_overwrite=True):
 		import yaml
-		with octoprint.util.atomic_write(path, "wb") as f:
+		with octoprint.util.atomic_write(path, "wb", max_permissions=0o666) as f:
 			yaml.safe_dump(profile, f, default_flow_style=False, indent="  ", allow_unicode=True)
 
 	def _convert_to_engine(self, profile_path, printer_profile, posX, posY):

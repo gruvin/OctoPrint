@@ -84,6 +84,16 @@ $(function() {
         self.pipVersion = ko.observable();
         self.pipUseSudo = ko.observable();
         self.pipAdditionalArgs = ko.observable();
+        self.pipPython = ko.observable();
+
+        self.safeMode = ko.observable();
+
+        self.pipUseUserString = ko.pureComputed(function() {
+            return self.pipUseUser() ? "yes" : "no";
+        });
+        self.pipVirtualEnvString = ko.pureComputed(function() {
+            return self.pipVirtualEnv() ? "yes" : "no";
+        });
 
         self.working = ko.observable(false);
         self.workingTitle = ko.observable();
@@ -95,7 +105,8 @@ $(function() {
         });
 
         self.enableToggle = function(data) {
-            return self.enableManagement() && data.key != 'pluginmanager';
+            var command = self._getToggleCommand(data);
+            return self.enableManagement() && (command == "disable" || !data.safe_mode_victim || data.safe_mode_enabled) && data.key != 'pluginmanager';
         };
 
         self.enableUninstall = function(data) {
@@ -107,7 +118,7 @@ $(function() {
         };
 
         self.enableRepoInstall = function(data) {
-            return self.enableManagement() && self.pipAvailable() && self.isCompatible(data);
+            return self.enableManagement() && self.pipAvailable() && !self.safeMode() && self.isCompatible(data);
         };
 
         self.invalidUrl = ko.pureComputed(function() {
@@ -117,7 +128,7 @@ $(function() {
 
         self.enableUrlInstall = ko.pureComputed(function() {
             var url = self.installUrl();
-            return self.enableManagement() && self.pipAvailable() && url !== undefined && url.trim() != "" && !self.invalidUrl();
+            return self.enableManagement() && self.pipAvailable() && !self.safeMode() && url !== undefined && url.trim() != "" && !self.invalidUrl();
         });
 
         self.invalidArchive = ko.pureComputed(function() {
@@ -127,7 +138,7 @@ $(function() {
 
         self.enableArchiveInstall = ko.pureComputed(function() {
             var name = self.uploadFilename();
-            return self.enableManagement() && self.pipAvailable() && name !== undefined && name.trim() != "" && !self.invalidArchive();
+            return self.enableManagement() && self.pipAvailable() && !self.safeMode() && name !== undefined && name.trim() != "" && !self.invalidArchive();
         });
 
         self.uploadElement.fileupload({
@@ -154,7 +165,7 @@ $(function() {
             done: function(e, data) {
                 self._markDone();
                 self.uploadButton.unbind("click");
-                self.uploadFilename("");
+                self.uploadFilename(undefined);
             },
             fail: function(e, data) {
                 new PNotify({
@@ -165,7 +176,7 @@ $(function() {
                 });
                 self._markDone();
                 self.uploadButton.unbind("click");
-                self.uploadFilename("");
+                self.uploadFilename(undefined);
             }
         });
 
@@ -186,6 +197,8 @@ $(function() {
             self._fromPluginsResponse(data.plugins);
             self._fromRepositoryResponse(data.repository);
             self._fromPipResponse(data.pip);
+
+            self.safeMode(data.safe_mode || false);
         };
 
         self._fromPluginsResponse = function(data) {
@@ -247,17 +260,16 @@ $(function() {
 
             var command = self._getToggleCommand(data);
 
-            var payload = {plugin: data.key};
-            self._postCommand(command, payload, function(response) {
-                self.requestData();
-            }, function() {
-                new PNotify({
-                    title: gettext("Something went wrong"),
-                    text: gettext("Please consult octoprint.log for details"),
-                    type: "error",
-                    hide: false
-                })
-            });
+            if (self._getToggleCommand(data) == "enable") {
+                if (data.safe_mode_victim && !data.safe_mode_enabled) return;
+                OctoPrint.plugins.pluginmanager.enable(data.key)
+                    .done(onSuccess)
+                    .fail(onError);
+            } else {
+                OctoPrint.plugins.pluginmanager.disable(data.key)
+                    .done(onSuccess)
+                    .fail(onError);
+            }
         };
 
         self.showRepository = function() {
@@ -446,6 +458,13 @@ $(function() {
                     new PNotify({
                         title: titleSuccess,
                         text: textRestart,
+                        buttons: {
+                            closer: true,
+                            sticker: false
+                        },
+                        callbacks: {
+                            before_close: beforeClose
+                        },
                         hide: false
                     });
                 } else if (response.needs_refresh) {
@@ -462,7 +481,7 @@ $(function() {
                             }]
                         },
                         buttons: {
-                            closer: false,
+                            closer: true,
                             sticker: false
                         },
                         hide: false
@@ -518,8 +537,9 @@ $(function() {
 
             self.loglines.removeAll();
             self.loglines.push({line: line, stream: "message"});
+            self._scrollWorkingOutputToEnd();
 
-            self.workingDialog.modal("show");
+            self.workingDialog.modal({keyboard: false, backdrop: "static", show: true});
         };
 
         self._markDone = function() {
@@ -533,7 +553,8 @@ $(function() {
         };
 
         self._getToggleCommand = function(data) {
-            return ((!data.enabled || data.pending_disable) && !data.pending_enable) ? "enable" : "disable";
+            var disable = (data.enabled || data.pending_enable || (data.safe_mode_victim && data.safe_mode_enabled)) && !data.pending_disable;
+            return disable ? "disable" : "enable";
         };
 
         self.toggleButtonCss = function(data) {
@@ -544,7 +565,16 @@ $(function() {
         };
 
         self.toggleButtonTitle = function(data) {
-            return self._getToggleCommand(data) == "enable" ? gettext("Enable Plugin") : gettext("Disable Plugin");
+            var command = self._getToggleCommand(data);
+            if (command == "enable") {
+                if (data.safe_mode_victim && !data.safe_mode_enabled) {
+                    return gettext("Disabled due to active safe mode");
+                } else {
+                    return gettext("Enable Plugin");
+                }
+            } else {
+                return gettext("Disable Plugin");
+            }
         };
 
         self.onBeforeBinding = function() {
@@ -554,7 +584,26 @@ $(function() {
         self.onUserLoggedIn = function(user) {
             if (user.admin) {
                 self.requestData();
+            } else {
+                self.onUserLoggedOut();
             }
+        };
+
+        self.onUserLoggedOut = function() {
+            self._closeAllNotifications();
+        };
+
+        self._closeAllNotifications = function() {
+            if (self.notifications) {
+                _.each(self.notifications, function(notification) {
+                    notification.remove();
+                });
+            }
+        };
+
+        self.onServerDisconnect = function() {
+            self._closeAllNotifications();
+            return true;
         };
 
         self.onStartup = function() {
@@ -589,7 +638,7 @@ $(function() {
 
             if (messageType == "loglines" && self.working()) {
                 _.each(data.loglines, function(line) {
-                    self.loglines.push(line);
+                    self.loglines.push(self._preprocessLine(line));
                 });
                 self._scrollWorkingOutputToEnd();
             } else if (messageType == "result") {
@@ -704,6 +753,14 @@ $(function() {
                 self.requestData();
             }
         };
+
+        self._forcedStdoutLine = /You are using pip version .*?, however version .*? is available\.|You should consider upgrading via the '.*?' command\./;
+        self._preprocessLine = function(line) {
+            if (line.stream == "stderr" && line.line.match(self._forcedStdoutLine)) {
+                line.stream = "stdout";
+            }
+            return line;
+        }
     }
 
     // view model class, parameters for constructor, container to bind to

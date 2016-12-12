@@ -158,12 +158,7 @@ $(function() {
         };
 
         self.requestData = function() {
-            $.ajax({
-                url: API_BASEURL + "slicing/cura/profiles",
-                type: "GET",
-                dataType: "json",
-                success: self.fromResponse
-            });
+            self.slicingViewModel.requestData();
         };
 
         self.fromResponse = function(data) {
@@ -182,7 +177,38 @@ $(function() {
 
         self.onBeforeBinding = function () {
             self.settings = self.settingsViewModel.settings;
-            self.requestData();
+            //self.requestData();
+        };
+
+        self.onSettingsHidden = function() {
+            self.resetPathTest();
+        };
+
+        self.onSlicingData = function(data) {
+            if (data && data.hasOwnProperty("cura") && data.cura.hasOwnProperty("profiles")) {
+                self.fromResponse(data.cura.profiles);
+            }
+        };
+
+        self.resetPathTest = function() {
+            self.pathBroken(false);
+            self.pathOk(false);
+            self.pathText("");
+        };
+
+        self.onWizardDetails = function(response) {
+            if (!response.hasOwnProperty("cura") || !response.cura.required) return;
+
+            if (response.cura.details.hasOwnProperty("engine")) {
+                self.unconfiguredCuraEngine(!response.cura.details.engine);
+            }
+            if (response.cura.details.hasOwnProperty("profile")) {
+                self.unconfiguredSlicingProfile(!response.cura.details.profile);
+            }
+        };
+
+        self.onWizardFinish = function() {
+            self.resetPathTest();
         };
     }
 

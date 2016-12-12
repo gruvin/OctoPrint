@@ -23,6 +23,10 @@ $(function() {
         self.appearance_colorTransparent = ko.observable();
         self.appearance_defaultLanguage = ko.observable();
 
+        self.active = false;
+        self.sawUpdateEventWhileActive = false;
+        self.ignoreNextUpdateEvent = false;
+
         self.settingsDialog = undefined;
         self.translationManagerDialog = undefined;
         self.translationUploadElement = $("#settings_appearance_managelanguagesdialog_upload");
@@ -124,6 +128,8 @@ $(function() {
         self.feature_keyboardControl = ko.observable(undefined);
         self.feature_pollWatched = ko.observable(undefined);
         self.feature_ignoreIdenticalResends = ko.observable(undefined);
+        self.feature_modelSizeDetection = ko.observable(undefined);
+        self.feature_firmwareDetection = ko.observable(undefined);
 
         self.serial_port = ko.observable();
         self.serial_baudrate = ko.observable();
@@ -195,6 +201,91 @@ $(function() {
             self.terminalFilters.remove(filter);
         };
 
+        self.testWebcamStreamUrl = function() {
+            if (!self.webcam_streamUrl()) {
+                return;
+            }
+
+            var text = gettext("If you see your webcam stream below, the entered stream URL is ok.");
+            var image = $('<img src="' + self.webcam_streamUrl() + '">');
+            var message = $("<p></p>")
+                .append(text)
+                .append(image);
+            showMessageDialog({
+                title: gettext("Stream test"),
+                message: message
+            });
+        };
+
+        self.testWebcamSnapshotUrl = function(viewModel, event) {
+            if (!self.webcam_snapshotUrl()) {
+                return;
+            }
+
+            var target = $(event.target);
+            target.prepend('<i class="icon-spinner icon-spin"></i> ');
+
+            var errorText = gettext("Could not retrieve snapshot URL, please double check the URL");
+            var errorTitle = gettext("Snapshot test failed");
+
+            OctoPrint.util.testUrl(self.webcam_snapshotUrl(), {method: "GET", response: "bytes"})
+                .done(function(response) {
+                    $("i.icon-spinner", target).remove();
+
+                    if (!response.result) {
+                        showMessageDialog({
+                            title: errorTitle,
+                            message: errorText
+                        });
+                        return;
+                    }
+
+                    var content = response.response.content;
+                    var mimeType = "image/jpeg";
+
+                    var headers = response.response.headers;
+                    if (headers && headers["content-type"]) {
+                        mimeType = headers["content-type"].split(";")[0];
+                    }
+
+                    var text = gettext("If you see your webcam snapshot picture below, the entered snapshot URL is ok.");
+                    showMessageDialog({
+                        title: gettext("Snapshot test"),
+                        message: $('<p>' + text + '</p><p><img src="data:' + mimeType + ';base64,' + content + '" /></p>')
+                    });
+                })
+                .fail(function() {
+                    $("i.icon-spinner", target).remove();
+                    showMessageDialog({
+                        title: errorTitle,
+                        message: errorText
+                    });
+                });
+        };
+
+        self.testWebcamFfmpegPath = function() {
+            if (!self.webcam_ffmpegPath()) {
+                return;
+            }
+
+            OctoPrint.util.testExecutable(self.webcam_ffmpegPath())
+                .done(function(response) {
+                    if (!response.result) {
+                        if (!response.exists) {
+                            self.webcam_ffmpegPathText(gettext("The path doesn't exist"));
+                        } else if (!response.typeok) {
+                            self.webcam_ffmpegPathText(gettext("The path is not a file"));
+                        } else if (!response.access) {
+                            self.webcam_ffmpegPathText(gettext("The path is not an executable"));
+                        }
+                    } else {
+                        self.webcam_ffmpegPathText(gettext("The path is valid"));
+                    }
+                    self.webcam_ffmpegPathOk(response.result);
+                    self.webcam_ffmpegPathBroken(!response.result);
+                });
+        };
+
         self.onSettingsShown = function() {
           self.requestData();
         };
@@ -236,6 +327,7 @@ $(function() {
 
         self.onAllBound = function(allViewModels) {
             self.settingsDialog.on('show', function(event) {
+                OctoPrint.coreui.settingsOpen = true;
                 if (event.target.id == "settings_dialog") {
                     self.requestTranslationData();
                     _.each(allViewModels, function(viewModel) {
@@ -246,6 +338,7 @@ $(function() {
                 }
             });
             self.settingsDialog.on('hidden', function(event) {
+                OctoPrint.coreui.settingsOpen = false;
                 if (event.target.id == "settings_dialog") {
                     _.each(allViewModels, function(viewModel) {
                         if (viewModel.hasOwnProperty("onSettingsHidden")) {
@@ -304,36 +397,32 @@ $(function() {
             }
 
             self.receiving(true);
-            $.ajax({
-                url: API_BASEURL + "settings",
-                type: "GET",
-                dataType: "json",
-                success: function(response) {
+            return OctoPrint.settings.get()
+                .always(function() {
+                    self.receiving(false);
+                })
+                .done(function(response) {
+                    self.fromResponse(response, local);
+
                     if (callback) {
                         self.callbacks.push(callback);
                     }
 
-                    try {
-                        self.fromResponse(response);
-
-                        var cb;
-                        while (self.callbacks.length) {
-                            cb = self.callbacks.shift();
-                            try {
-                                cb();
-                            } catch(exc) {
-                                log.error("Error calling settings callback", cb, ":", (exc.stack || exc));
-                            }
-                        }
-                    } finally {
-                        self.receiving(false);
-                        self.callbacks = [];
-                    }
-                },
-                error: function(xhr) {
-                    self.receiving(false);
-                }
-            });
+                    // resolve all promises
+                    var args = arguments;
+                    _.each(self.outstanding, function(deferred) {
+                        deferred.resolve(args);
+                    });
+                    self.outstanding = [];
+                })
+                .fail(function() {
+                    // reject all promises
+                    var args = arguments;
+                    _.each(self.outstanding, function(deferred) {
+                        deferred.reject(args);
+                    });
+                    self.outstanding = [];
+                });
         };
 
         self.requestTranslationData = function(callback) {
@@ -501,6 +590,9 @@ $(function() {
         self.saveData = function (data, successCallback) {
             self.settingsDialog.trigger("beforeSave");
 
+            self.sawUpdateEventWhileSending = false;
+            self.sending(data == undefined || options.sending || false);
+
             if (data == undefined) {
                 // we only set sending to true when we didn't include data
                 self.sending(true);
@@ -602,15 +694,15 @@ $(function() {
                 });
             }
 
-            $.ajax({
-                url: API_BASEURL + "settings",
-                type: "POST",
-                dataType: "json",
-                contentType: "application/json; charset=UTF-8",
-                data: JSON.stringify(data),
-                success: function(response) {
+            self.active = true;
+            return OctoPrint.settings.save(data)
+                .done(function(data, status, xhr) {
+                    self.ignoreNextUpdateEvent = !self.sawUpdateEventWhileSending;
+                    self.active = false;
+
                     self.receiving(true);
                     self.sending(false);
+
                     try {
                         self.fromResponse(response);
                         if (successCallback) successCallback(response);
@@ -620,12 +712,56 @@ $(function() {
                 },
                 error: function(xhr) {
                     self.sending(false);
+                    self.active = false;
+                    if (options.error) options.error(xhr, status, error);
+                })
+                .always(function(xhr, status) {
+                    if (options.complete) options.complete(xhr, status);
+                });
+        };
+
+        self.onEventSettingsUpdated = function() {
+            if (self.active) {
+                self.sawUpdateEventWhileActive = true;
+            }
+
+            var preventSettingsRefresh = _.any(self.allViewModels, function(viewModel) {
+                if (viewModel.hasOwnProperty("onSettingsPreventRefresh")) {
+                    try {
+                        return viewModel["onSettingsPreventRefresh"]();
+                    } catch (e) {
+                        log.warn("Error while calling onSettingsPreventRefresh on", viewModel, ":", e);
+                        return false;
+                    }
+                } else {
+                    return false;
                 }
             });
         };
 
-        self.onEventSettingsUpdated = function() {
-            self.requestData();
+            if (preventSettingsRefresh) {
+                // if any of our viewmodels prevented this refresh, we'll just return now
+                return;
+            }
+
+            if (self.isDialogActive()) {
+                // dialog is open and not currently busy...
+                if (self.sending() || self.receiving() || self.active || self.ignoreNextUpdateEvent) {
+                    self.ignoreNextUpdateEvent = false;
+                    return;
+                }
+
+                if (!hasDataChanged(self.getLocalData(), self.lastReceivedSettings)) {
+                    // we don't have local changes, so just fetch new data
+                    self.requestData();
+                } else {
+                    // we have local changes, show update dialog
+                    self.settingsUpdatedDialog.modal("show");
+                }
+            } else {
+                // dialog is not open, just fetch new data
+                self.requestData();
+            }
         };
 
         self._resetScrollPosition = function() {
@@ -641,6 +777,12 @@ $(function() {
             } else {
                 $('ul.nav-list a:first', self.settingsDialog).tab("show");
             }
+        };
+
+        self.onServerReconnect = function() {
+            // the settings might have changed if the server was just restarted,
+            // better refresh them now
+            self.requestData();
         };
     }
 
